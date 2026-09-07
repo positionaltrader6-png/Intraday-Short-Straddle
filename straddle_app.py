@@ -655,54 +655,121 @@ def run_dates(dates, run_type, variants, expiry_override=None,
 # ============================== THEME + HELPERS =============================
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-.stApp { background:#fdf4f8; }
-html, body, [class*="css"] { font-family:'Inter',sans-serif; }
+.stApp { background:
+   radial-gradient(1100px 500px at 12% -8%, #ffe9f4 0%, transparent 60%),
+   radial-gradient(900px 460px at 92% 4%, #e9edff 0%, transparent 58%),
+   #f7f5fb; }
+html, body, [class*="css"], .stMarkdown, p, div, span, label
+   { font-family:'Plus Jakarta Sans',sans-serif; }
 #MainMenu, footer, header { visibility:hidden; }
-.block-container { padding-top:1.2rem; padding-bottom:2rem; max-width:1500px; }
+.block-container { padding:1rem 2rem 3rem; max-width:1480px; }
 
-section[data-testid="stSidebar"] { background:#ffffff; border-right:1px solid #f2e3ec; }
-section[data-testid="stSidebar"] .block-container { padding-top:1.5rem; }
+/* ---------- sidebar ---------- */
+section[data-testid="stSidebar"] {
+  background:linear-gradient(180deg,#1c1030 0%,#2a1246 55%,#33144f 100%);
+  border-right:none; }
+section[data-testid="stSidebar"] * { color:#ede7f6; }
+section[data-testid="stSidebar"] .block-container { padding-top:1.6rem; }
+.brand { font-size:1.12rem; font-weight:800; letter-spacing:-.02em; color:#fff;
+  display:flex; align-items:center; gap:.5rem; margin:0 0 .25rem 0; }
+.brand-dot { width:9px; height:9px; border-radius:50%;
+  background:linear-gradient(135deg,#f472b6,#a78bfa);
+  box-shadow:0 0 12px rgba(244,114,182,.85); }
+.brand-sub { font-size:.72rem; color:#b9a8d4; margin-bottom:1.5rem;
+  letter-spacing:.04em; text-transform:uppercase; font-weight:600; }
 
-.brand { display:flex; align-items:center; gap:.55rem; padding:.7rem .9rem;
-  background:linear-gradient(135deg,#ec4899,#d946ef); border-radius:12px;
-  color:#fff; font-weight:700; font-size:1.05rem; margin-bottom:1.4rem; }
+/* nav: turn the radio group into nav rows */
+section[data-testid="stSidebar"] div[role="radiogroup"] { gap:.3rem; }
+section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+  background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.06);
+  border-radius:11px; padding:.6rem .85rem; width:100%; cursor:pointer;
+  transition:all .16s ease; font-weight:600; font-size:.9rem; }
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+  background:rgba(255,255,255,.11); transform:translateX(2px); }
+section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child
+  { display:none; }
+section[data-testid="stSidebar"] div[role="radiogroup"] > label[data-checked="true"],
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {
+  background:linear-gradient(135deg,#ec4899,#a855f7);
+  border-color:transparent; box-shadow:0 6px 18px rgba(168,85,247,.35); }
+.side-sep { height:1px; background:rgba(255,255,255,.09); margin:1.3rem 0 1rem; }
+.side-lbl { font-size:.66rem; text-transform:uppercase; letter-spacing:.09em;
+  color:#a692c4; font-weight:700; margin-bottom:.5rem; }
+.side-kv { display:flex; justify-content:space-between; font-size:.76rem;
+  padding:.3rem 0; color:#cfc2e4; }
+.side-kv b { color:#fff; font-weight:600; }
 
-.panel { background:#fff; border-radius:16px; padding:1.15rem 1.3rem;
-  box-shadow:0 1px 3px rgba(80,20,60,.06); border:1px solid #f6e8f0;
-  margin-bottom:1rem; }
-.panel h4 { margin:0 0 .15rem 0; font-size:1rem; font-weight:600; color:#1f1235; }
-.panel .sub { font-size:.78rem; color:#9b8aa6; }
+/* ---------- header ---------- */
+.hdr { display:flex; align-items:flex-end; justify-content:space-between;
+  margin:.2rem 0 1.4rem; flex-wrap:wrap; gap:.8rem; }
+.hdr h1 { font-size:1.85rem; font-weight:800; letter-spacing:-.03em; margin:0;
+  background:linear-gradient(120deg,#1e1035 20%,#7c3aed 60%,#ec4899 95%);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.hdr .tag { font-size:.85rem; color:#7c6f8c; margin-top:.15rem; font-weight:500; }
+.chip { display:inline-flex; align-items:center; gap:.4rem; padding:.42rem .85rem;
+  border-radius:99px; font-size:.76rem; font-weight:700; background:#fff;
+  border:1px solid #ece3f5; box-shadow:0 2px 8px rgba(80,20,120,.06); }
+.chip .dot { width:7px; height:7px; border-radius:50%; }
+.dot-live { background:#22c55e; box-shadow:0 0 9px #22c55e; }
+.dot-off  { background:#cbd5e1; }
 
-.kpi { border-radius:16px; padding:1.05rem 1.15rem; color:#fff;
-  box-shadow:0 4px 14px rgba(120,40,90,.16); }
-.kpi .lbl { font-size:.74rem; text-transform:uppercase; letter-spacing:.06em;
-  opacity:.9; font-weight:600; }
-.kpi .val { font-size:1.75rem; font-weight:700; line-height:1.25; margin-top:.2rem; }
-.kpi .fin { font-size:.76rem; opacity:.9; margin-top:.1rem; }
-.g1 { background:linear-gradient(135deg,#ec4899,#f43f5e); }
-.g2 { background:linear-gradient(135deg,#8b5cf6,#6366f1); }
-.g3 { background:linear-gradient(135deg,#0ea5e9,#06b6d4); }
-.g4 { background:linear-gradient(135deg,#f59e0b,#f97316); }
-.gneg { background:linear-gradient(135deg,#64748b,#475569); }
+/* ---------- panels ---------- */
+.panel { background:rgba(255,255,255,.82); backdrop-filter:blur(6px);
+  border-radius:20px; padding:1.25rem 1.4rem; border:1px solid rgba(255,255,255,.9);
+  box-shadow:0 8px 26px rgba(80,20,120,.07); margin-bottom:1.1rem; }
+.panel h4 { margin:0; font-size:1.02rem; font-weight:700; color:#1e1035;
+  letter-spacing:-.01em; }
+.panel .sub { font-size:.79rem; color:#8b7d9c; margin-top:.2rem; font-weight:500; }
 
-.stat { background:#fff; border-radius:14px; padding:.85rem 1rem;
-  border:1px solid #f6e8f0; }
-.stat .lbl { font-size:.72rem; color:#9b8aa6; text-transform:uppercase;
-  letter-spacing:.05em; font-weight:600; }
-.stat .val { font-size:1.3rem; font-weight:700; color:#1f1235; }
+/* ---------- kpi ---------- */
+.kpi { border-radius:20px; padding:1.2rem 1.3rem; color:#fff; position:relative;
+  overflow:hidden; box-shadow:0 10px 28px rgba(90,25,120,.22);
+  transition:transform .18s ease; }
+.kpi:hover { transform:translateY(-3px); }
+.kpi:after { content:""; position:absolute; right:-28px; top:-28px; width:110px;
+  height:110px; border-radius:50%; background:rgba(255,255,255,.13); }
+.kpi .lbl { font-size:.7rem; text-transform:uppercase; letter-spacing:.09em;
+  font-weight:700; opacity:.92; }
+.kpi .val { font-size:1.95rem; font-weight:800; letter-spacing:-.03em;
+  line-height:1.15; margin-top:.35rem; }
+.kpi .fin { font-size:.75rem; opacity:.88; margin-top:.25rem; font-weight:500; }
+.g1 { background:linear-gradient(135deg,#f43f5e,#ec4899 55%,#d946ef); }
+.g2 { background:linear-gradient(135deg,#8b5cf6,#6366f1 60%,#4f46e5); }
+.g3 { background:linear-gradient(135deg,#06b6d4,#0ea5e9 60%,#3b82f6); }
+.g4 { background:linear-gradient(135deg,#f59e0b,#f97316 60%,#ef4444); }
+.gneg { background:linear-gradient(135deg,#475569,#64748b); }
+.gmute { background:linear-gradient(135deg,#e6e0ee,#efeaf6); color:#7c6f8c;
+  box-shadow:none; border:1px dashed #ddd2ea; }
+.gmute .val { color:#a99bbd; }
 
-.pill { display:inline-block; padding:.2rem .6rem; border-radius:20px;
-  font-size:.7rem; font-weight:600; }
-.pill-live { background:#dcfce7; color:#15803d; }
-.pill-off  { background:#f1f5f9; color:#64748b; }
+/* ---------- stat tile ---------- */
+.stat { background:#fff; border-radius:16px; padding:.95rem 1.1rem;
+  border:1px solid #f0e9f7; box-shadow:0 2px 10px rgba(80,20,120,.045); }
+.stat .lbl { font-size:.68rem; color:#9b8aa6; text-transform:uppercase;
+  letter-spacing:.08em; font-weight:700; }
+.stat .val { font-size:1.32rem; font-weight:800; color:#1e1035;
+  letter-spacing:-.02em; margin-top:.15rem; }
 
-.stButton>button { border-radius:10px; font-weight:600; border:none;
-  background:linear-gradient(135deg,#ec4899,#d946ef); color:#fff; padding:.5rem 1.2rem; }
-.stButton>button:hover { filter:brightness(1.07); color:#fff; }
-div[data-testid="stDataFrame"] { border-radius:12px; overflow:hidden;
-  border:1px solid #f0e3ec; }
+/* ---------- empty state ---------- */
+.empty { text-align:center; padding:2.6rem 1rem; color:#9b8aa6; }
+.empty .ico { font-size:2rem; opacity:.5; }
+.empty .t { font-weight:700; color:#5c4d70; margin-top:.5rem; font-size:.98rem; }
+.empty .s { font-size:.82rem; margin-top:.25rem; }
+
+/* ---------- widgets ---------- */
+.stButton>button { border-radius:13px; font-weight:700; border:none; width:100%;
+  background:linear-gradient(135deg,#ec4899,#a855f7); color:#fff;
+  padding:.62rem 1.2rem; letter-spacing:.01em;
+  box-shadow:0 6px 18px rgba(168,85,247,.32); transition:all .16s ease; }
+.stButton>button:hover { transform:translateY(-2px); color:#fff;
+  box-shadow:0 10px 24px rgba(168,85,247,.42); }
+div[data-testid="stDataFrame"] { border-radius:14px; overflow:hidden;
+  border:1px solid #efe6f6; box-shadow:0 3px 14px rgba(80,20,120,.05); }
+div[data-baseweb="select"]>div, div[data-testid="stDateInput"] input {
+  border-radius:11px !important; border-color:#eadff5 !important; }
+.stProgress > div > div > div { background:linear-gradient(90deg,#ec4899,#a855f7); }
 </style>
 """
 
@@ -718,15 +785,27 @@ def stat(label, value):
     return f'<div class="stat"><div class="lbl">{label}</div><div class="val">{value}</div></div>'
 
 
-def panel_open(title, sub=""):
-    return f'<div class="panel"><h4>{title}</h4><div class="sub">{sub}</div>'
+def panel(title, sub=""):
+    return f'<div class="panel"><h4>{title}</h4><div class="sub">{sub}</div></div>' 
+
+
+def empty_state(title, sub, ico="◇"):
+    return (f'<div class="panel"><div class="empty"><div class="ico">{ico}</div>'
+            f'<div class="t">{title}</div><div class="s">{sub}</div></div></div>')
+
+
+def header(title, tag, live):
+    dot = "dot-live" if live else "dot-off"
+    txt = f"Session open · {dt.datetime.now():%H:%M}" if live else           f"Session closed · {dt.datetime.now():%H:%M}"
+    return (f'<div class="hdr"><div><h1>{title}</h1><div class="tag">{tag}</div></div>'
+            f'<div class="chip"><span class="dot {dot}"></span>{txt}</div></div>')
 
 
 def money(x):
     try:
         return f"{float(x):+,.0f}"
     except Exception:
-        return "-"
+        return "--"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -782,70 +861,120 @@ for _k, _v in SHEET_KEYS.items():
         st.error(f"Missing [sheets] {_v} in secrets (needed for {_k}).")
         st.stop()
 
+TODAY = dt.date.today()
+NOW = dt.datetime.now()
+SESSION_LIVE = (TODAY.weekday() < 5 and dt.time(9, 15) <= NOW.time() < dt.time(15, 30))
+SESSION_OVER = NOW.time() >= dt.time(15, 30)
+
 # ---------------- sidebar ----------------
 with st.sidebar:
-    st.markdown('<div class="brand">◆ Straddle Desk</div>', unsafe_allow_html=True)
-    page = st.radio("", ["Live run", "Backtest", "History"], label_visibility="collapsed")
-    st.markdown("---")
-    _now = dt.datetime.now()
-    _over = _now.time() >= dt.time(15, 30)
-    _wk = dt.date.today().weekday() >= 5
-    _pill = ("pill-off", "Closed — weekend") if _wk else             (("pill-off", f"Session over · {_now:%H:%M}") if _over
-             else ("pill-live", f"Session open · {_now:%H:%M}"))
-    st.markdown(f'<span class="pill {_pill[0]}">{_pill[1]}</span>', unsafe_allow_html=True)
-    st.caption(f"Front-month token `{NIFTY_FUT_TOKEN}` — update after each roll.")
-    st.caption(f"Tighten mode: `{TIGHTEN_MODE}`")
+    st.markdown('<div class="brand"><span class="brand-dot"></span>Straddle Desk</div>'
+                '<div class="brand-sub">NIFTY · short premium</div>',
+                unsafe_allow_html=True)
+    page = st.radio("nav", ["Live run", "Backtest", "History"],
+                    label_visibility="collapsed")
+    st.markdown('<div class="side-sep"></div><div class="side-lbl">Configuration</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="side-kv"><span>Front-month</span><b>{NIFTY_FUT_TOKEN}</b></div>'
+        f'<div class="side-kv"><span>Lot size</span><b>{LOT_SIZE}</b></div>'
+        f'<div class="side-kv"><span>Base SL</span><b>{SL_MULTIPLIER}x</b></div>'
+        f'<div class="side-kv"><span>Tight SL</span><b>{TIGHT_SL_MULTIPLIER}x</b></div>'
+        f'<div class="side-kv"><span>Tighten</span><b>{TIGHTEN_MODE.split("_")[0].title()}</b></div>'
+        f'<div class="side-kv"><span>Max/day</span><b>{MAX_STRADDLES_PER_DAY}</b></div>'
+        f'<div class="side-kv"><span>Entry window</span>'
+        f'<b>{ENTRY_START:%H:%M}-{ENTRY_END:%H:%M}</b></div>'
+        f'<div class="side-kv"><span>Hard exit</span><b>{HARD_EXIT:%H:%M}</b></div>',
+        unsafe_allow_html=True)
+    st.markdown('<div class="side-sep"></div>', unsafe_allow_html=True)
+    st.caption("Paper only. No orders are ever placed.")
 
 
-def render_kpis(S, variants, sessions_note=""):
+def render_kpis(S, variants, note=""):
     cols = st.columns(len(variants) + 1)
     for c, v in zip(cols, variants):
-        g = S[S.strategy == v[0]]
-        pnl = pd.to_numeric(g.total_pnl, errors="coerce").sum() if not g.empty else 0
-        grad = GRADS.get(v[0], "g1") if pnl >= 0 else "gneg"
-        legs = int(pd.to_numeric(g.num_legs, errors="coerce").sum()) if not g.empty else 0
+        g = S[S.strategy == v[0]] if not S.empty else S
+        has = not g.empty
+        pnl = pd.to_numeric(g.total_pnl, errors="coerce").sum() if has else 0
+        legs = int(pd.to_numeric(g.num_legs, errors="coerce").sum()) if has else 0
+        grad = ("gmute" if not has else
+                (GRADS.get(v[0], "g1") if pnl >= 0 else "gneg"))
         with c:
-            st.markdown(kpi(v[0].replace("_", " "), money(pnl), f"{legs} legs", grad),
+            st.markdown(kpi(v[0].replace("_", " "), money(pnl) if has else "--",
+                            f"{legs} legs" if has else "no data", grad),
                         unsafe_allow_html=True)
     with cols[-1]:
         n = S.trading_date.nunique() if not S.empty else 0
-        st.markdown(kpi("Sessions", str(n), sessions_note, "g4"), unsafe_allow_html=True)
+        st.markdown(kpi("Sessions", str(n), note or "recorded",
+                        "g4" if n else "gmute"), unsafe_allow_html=True)
 
 
-# ---------------- Live run ----------------
+def render_run(T, S, H, O, variants, kind, write):
+    if not S.empty:
+        render_kpis(S, variants)
+    if not O.empty:
+        st.markdown(panel("Still open",
+                    "session unfinished — these are live, not written to the sheet"),
+                    unsafe_allow_html=True)
+        st.dataframe(O, use_container_width=True, hide_index=True)
+    if not T.empty:
+        a, b = st.columns([1.9, 1])
+        with a:
+            st.markdown(panel("Closed legs", f"{len(T)} recorded"),
+                        unsafe_allow_html=True)
+            st.dataframe(T.drop(columns=["run_type"], errors="ignore"),
+                         use_container_width=True, hide_index=True, height=300)
+        with b:
+            ch = reason_chart(T)
+            if ch is not None:
+                st.markdown(panel("Exit reasons"), unsafe_allow_html=True)
+                st.altair_chart(ch, use_container_width=True)
+    if T.empty and O.empty:
+        st.markdown(empty_state("No trades", "Entry conditions were not met.", "○"),
+                    unsafe_allow_html=True)
+    if write and not T.empty:
+        append_rows(kind, TAB_TRADES, TRADE_HEADERS, T.values.tolist())
+        append_rows(kind, TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
+        if not H.empty:
+            append_rows(kind, TAB_HEARTBEAT, HEARTBEAT_HEADERS, H.values.tolist())
+        st.success(f"{len(T)} legs written.")
+
+
+# ================================ LIVE ======================================
 if page == "Live run":
-    st.markdown(panel_open("Live run",
-                "FIXED_1_3X and DYNAMIC_SL · paper only, no orders placed") +
-                "</div>", unsafe_allow_html=True)
-    today = dt.date.today()
-    c1, c2, c3 = st.columns([1.1, 1.1, 1])
-    with c1:
-        st.markdown(stat("Trading day", today.strftime("%d %b %Y")), unsafe_allow_html=True)
+    st.markdown(header("Live run", "FIXED_1_3X · DYNAMIC_SL — paper, no orders placed",
+                       SESSION_LIVE), unsafe_allow_html=True)
     try:
-        exps = expiries_for(today)
+        exps = expiries_for(TODAY)
     except Exception as e:
         st.error(f"Could not load expiries: {e}"); st.stop()
-    with c2:
-        exp_live = st.selectbox("Expiry", exps,
-                                format_func=lambda d: f"{d:%d %b %Y} · {(d-today).days}d",
-                                key="exp_live")
-    session_over = dt.datetime.now().time() >= dt.time(15, 30)
-    with c3:
-        st.write("")
-        go = st.button("Run session", type="primary", use_container_width=True)
 
-    if today.weekday() >= 5:
-        st.warning("Weekend — no session.")
-    elif not session_over:
-        st.info(f"Session still open. Results are provisional and nothing is written "
-                f"to the sheet until you run after 15:30.")
+    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1])
+    with c1:
+        st.markdown(stat("Trading day", TODAY.strftime("%d %b %Y")), unsafe_allow_html=True)
+    with c2:
+        st.markdown(stat("Weekday", TODAY.strftime("%A")), unsafe_allow_html=True)
+    with c3:
+        exp_live = st.selectbox("Expiry", exps,
+                                format_func=lambda d: f"{d:%d %b} · {(d-TODAY).days}d",
+                                key="exp_live", label_visibility="collapsed")
+        st.caption("Expiry")
+    with c4:
+        st.write("")
+        go = st.button("Run session", type="primary")
+
+    if TODAY.weekday() >= 5:
+        st.info("Weekend — no session to run.")
+    elif not SESSION_OVER:
+        st.info("Session still open. Results are provisional and nothing is written "
+                "to the sheet until you run after 15:30.")
 
     if go:
-        p = st.progress(0.0, text="fetching")
+        p = st.progress(0.0, text="fetching candles")
         try:
-            out, logs, notes, err = run_dates([today], "LIVE", VARIANTS_LIVE,
+            out, logs, notes, err = run_dates([TODAY], "LIVE", VARIANTS_LIVE,
                                               expiry_override=exp_live,
-                                              finalize=session_over, progress=p)
+                                              finalize=SESSION_OVER, progress=p)
             p.empty()
             if err:
                 st.error(err)
@@ -853,54 +982,45 @@ if page == "Live run":
                 T, S, H, O = out
                 for n in notes:
                     st.warning(n)
-                if not S.empty:
-                    render_kpis(S, VARIANTS_LIVE, today.strftime("%d %b"))
-                if not O.empty:
-                    st.markdown(panel_open("Still open",
-                                "session unfinished — not written to the sheet") +
-                                "</div>", unsafe_allow_html=True)
-                    st.dataframe(O, use_container_width=True, hide_index=True)
-                if not T.empty:
-                    a, b = st.columns([2, 1])
-                    with a:
-                        st.markdown(panel_open("Closed legs") + "</div>",
-                                    unsafe_allow_html=True)
-                        st.dataframe(T.drop(columns=["run_type"]),
-                                     use_container_width=True, hide_index=True)
-                    with b:
-                        ch = reason_chart(T)
-                        if ch is not None:
-                            st.markdown(panel_open("Exit reasons") + "</div>",
-                                        unsafe_allow_html=True)
-                            st.altair_chart(ch, use_container_width=True)
-                if T.empty and O.empty:
-                    st.info("No trades — entry conditions not met.")
-
-                if session_over and not T.empty:
-                    append_rows("LIVE", TAB_TRADES, TRADE_HEADERS, T.values.tolist())
-                    append_rows("LIVE", TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
-                    if not H.empty:
-                        append_rows("LIVE", TAB_HEARTBEAT, HEARTBEAT_HEADERS, H.values.tolist())
-                    st.success(f"{len(T)} legs written to the live sheet.")
+                render_run(T, S, H, O, VARIANTS_LIVE, "LIVE", SESSION_OVER)
                 with st.expander("Engine log"):
                     st.code("\n".join(logs) or "(nothing)")
         except Exception as e:
             p.empty(); st.error(f"{type(e).__name__}: {e}")
+    else:
+        try:
+            S = read_tab("LIVE", TAB_SUMMARY)
+        except Exception:
+            S = pd.DataFrame()
+        if S.empty:
+            render_kpis(pd.DataFrame(columns=["strategy", "total_pnl", "num_legs",
+                                              "trading_date"]), VARIANTS_LIVE)
+            st.markdown(empty_state("Nothing recorded yet",
+                        "Press Run session after 15:30 to record today.", "◇"),
+                        unsafe_allow_html=True)
+        else:
+            S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
+            render_kpis(S, VARIANTS_LIVE, "to date")
+            ch = equity_chart(S)
+            if ch is not None:
+                st.markdown(panel("Cumulative P&L", "live paper record"),
+                            unsafe_allow_html=True)
+                st.altair_chart(ch, use_container_width=True)
 
-# ---------------- Backtest ----------------
+# ================================ BACKTEST =================================
 elif page == "Backtest":
-    st.markdown(panel_open("Backtest",
-                "FIXED_1_3X · DYNAMIC_SL · NAKED_CARRY — one shared data feed") +
-                "</div>", unsafe_allow_html=True)
+    st.markdown(header("Backtest", "FIXED_1_3X · DYNAMIC_SL · NAKED_CARRY — "
+                       "one shared data feed", SESSION_LIVE), unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
-    mode = c1.radio("Range", ["Single day", "Date range"], key="bt_mode")
+    mode = c1.radio("Range", ["Single day", "Date range"], key="bt_mode",
+                    horizontal=True)
     if mode == "Single day":
-        bt_day = c2.date_input("Trading day", value=dt.date.today(), key="bt_day")
+        bt_day = c2.date_input("Trading day", value=TODAY, key="bt_day")
         days = [bt_day] if bt_day.weekday() < 5 else []
         ref = bt_day
     else:
-        d1 = c2.date_input("From", value=dt.date.today()-dt.timedelta(days=7), key="bt_from")
-        d2 = c3.date_input("To", value=dt.date.today(), key="bt_to")
+        d1 = c2.date_input("From", value=TODAY-dt.timedelta(days=7), key="bt_from")
+        d2 = c3.date_input("To", value=TODAY, key="bt_to")
         days = [d for d in (d1+dt.timedelta(days=k) for k in range((d2-d1).days+1))
                 if d.weekday() < 5]
         ref = d1
@@ -908,18 +1028,22 @@ elif page == "Backtest":
         bexps = expiries_for(ref)
     except Exception as e:
         st.error(f"Could not load expiries: {e}"); st.stop()
-    c4, c5, c6 = st.columns([1.2, 1.2, 1])
+
+    c4, c5, c6 = st.columns([1.3, 1.3, 1])
     auto = c4.checkbox("Nearest expiry per day", value=True,
-                       help="Uncheck to force one expiry across the range.")
+                       help="Uncheck to force one expiry across the whole range.")
     exp_bt = None if auto else c5.selectbox("Expiry", bexps,
                                             format_func=lambda d: f"{d:%d %b %Y}",
                                             key="exp_bt")
     save = c6.checkbox("Save to sheet", value=False)
-    if st.button("Run backtest", type="primary"):
+    st.caption(f"{len(days)} weekday(s) selected")
+    run_bt = st.button("Run backtest", type="primary")
+
+    if run_bt:
         if not days:
             st.warning("No weekdays selected.")
         else:
-            p = st.progress(0.0, text="fetching")
+            p = st.progress(0.0, text="fetching candles")
             try:
                 out, logs, notes, err = run_dates(days, "BACKTEST", VARIANTS_BACKTEST,
                                                   expiry_override=exp_bt,
@@ -932,37 +1056,34 @@ elif page == "Backtest":
                     for n in notes:
                         st.warning(n)
                     if S.empty:
-                        st.info("No trades over that range.")
+                        st.markdown(empty_state("No trades",
+                                    "Entry conditions were not met in that range.", "○"),
+                                    unsafe_allow_html=True)
                     else:
                         render_kpis(S, VARIANTS_BACKTEST, f"{len(days)} weekdays")
-                        a, b = st.columns([2, 1])
+                        a, b = st.columns([1.9, 1])
                         with a:
                             ch = equity_chart(S)
                             if ch is not None:
-                                st.markdown(panel_open("Cumulative P&L") + "</div>",
-                                            unsafe_allow_html=True)
+                                st.markdown(panel("Cumulative P&L"), unsafe_allow_html=True)
                                 st.altair_chart(ch, use_container_width=True)
                         with b:
                             rc = reason_chart(T)
                             if rc is not None:
-                                st.markdown(panel_open("Exit reasons") + "</div>",
-                                            unsafe_allow_html=True)
+                                st.markdown(panel("Exit reasons"), unsafe_allow_html=True)
                                 st.altair_chart(rc, use_container_width=True)
-                        st.markdown(panel_open("Per-session summary") + "</div>",
-                                    unsafe_allow_html=True)
-                        st.dataframe(S.drop(columns=["run_type"]),
+                        st.markdown(panel("Per-session summary"), unsafe_allow_html=True)
+                        st.dataframe(S.drop(columns=["run_type"], errors="ignore"),
                                      use_container_width=True, hide_index=True)
-                        d1_, d2_ = st.columns(2)
-                        d1_.download_button("Download trades", T.to_csv(index=False),
-                                            "straddle_trades.csv", "text/csv",
-                                            use_container_width=True)
+                        e1, e2 = st.columns(2)
+                        e1.download_button("Download trades", T.to_csv(index=False),
+                                           "straddle_trades.csv", "text/csv")
                         if not H.empty:
                             fired = (H.trend.astype(str) != "").sum()
                             st.caption(f"Heartbeat: {len(H)} bars evaluated, "
                                        f"trend fired on {fired}.")
-                            d2_.download_button("Download heartbeat", H.to_csv(index=False),
-                                                "straddle_heartbeat.csv", "text/csv",
-                                                use_container_width=True)
+                            e2.download_button("Download heartbeat", H.to_csv(index=False),
+                                               "straddle_heartbeat.csv", "text/csv")
                         if save:
                             append_rows("BACKTEST", TAB_TRADES, TRADE_HEADERS, T.values.tolist())
                             append_rows("BACKTEST", TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
@@ -974,26 +1095,40 @@ elif page == "Backtest":
                         st.code("\n".join(logs) or "(nothing)")
             except Exception as e:
                 p.empty(); st.error(f"{type(e).__name__}: {e}")
+    else:
+        st.markdown(empty_state("Ready", "Pick a range and press Run backtest.", "◈"),
+                    unsafe_allow_html=True)
 
-# ---------------- History ----------------
+# ================================ HISTORY ==================================
 else:
-    st.markdown(panel_open("History", "accumulated live paper record") + "</div>",
+    st.markdown(header("History", "accumulated record", SESSION_LIVE),
                 unsafe_allow_html=True)
-    src = st.radio("Source", ["Live", "Backtest"], horizontal=True)
+    c1, c2 = st.columns([1.4, 1])
+    src = c1.radio("Source", ["Live", "Backtest"], horizontal=True)
     kind = "LIVE" if src == "Live" else "BACKTEST"
     variants = VARIANTS_LIVE if kind == "LIVE" else VARIANTS_BACKTEST
-    if st.button("Load"):
-        S = read_tab(kind, TAB_SUMMARY)
+    with c2:
+        st.write("")
+        load = st.button("Load")
+    if load:
+        try:
+            S = read_tab(kind, TAB_SUMMARY)
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}"); S = pd.DataFrame()
         if S.empty:
-            st.info("Nothing recorded yet.")
+            st.markdown(empty_state("Nothing recorded", f"The {src.lower()} sheet is empty.",
+                        "◇"), unsafe_allow_html=True)
         else:
             S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
             render_kpis(S, variants, f"{S.trading_date.nunique()} recorded")
             ch = equity_chart(S)
             if ch is not None:
-                st.markdown(panel_open("Cumulative P&L") + "</div>", unsafe_allow_html=True)
+                st.markdown(panel("Cumulative P&L"), unsafe_allow_html=True)
                 st.altair_chart(ch, use_container_width=True)
-            st.markdown(panel_open("Sessions") + "</div>", unsafe_allow_html=True)
+            st.markdown(panel("Sessions"), unsafe_allow_html=True)
             st.dataframe(S.tail(80), use_container_width=True, hide_index=True)
             st.download_button("Download summary", S.to_csv(index=False),
                                f"{kind.lower()}_summary.csv", "text/csv")
+    else:
+        st.markdown(empty_state("Ready", "Choose a source and press Load.", "◈"),
+                    unsafe_allow_html=True)
