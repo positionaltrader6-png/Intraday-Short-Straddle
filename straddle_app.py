@@ -45,11 +45,13 @@ import datetime as dt
 import time
 from dataclasses import dataclass, field
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="NIFTY Straddle", page_icon="•", layout="wide")
+st.set_page_config(page_title="Straddle Desk", page_icon="◆", layout="wide",
+                   initial_sidebar_state="expanded")
 
 # ============================== CONSTANTS ===================================
 NIFTY_INDEX_TOKEN = "99926000"
@@ -224,6 +226,11 @@ def nearest_expiry(expiries, day):
     if not f:
         raise RuntimeError(f"No NIFTY expiry on/after {day}")
     return f[0]
+
+
+def expiry_choices(expiries, day, n=6):
+    """Expiries on or after `day`, nearest first."""
+    return [e for e in expiries if e >= day][:n]
 
 
 def opt_symbol(expiry, strike, ot):
@@ -558,7 +565,7 @@ class StraddleEngine:
             if self.entry_ok(nifty.iloc[: i+1], self._vix, i, now):
                 self.deploy(day, spot, fut, now, i)
 
-    def run_day(self, day, nifty, vix, fut):
+    def run_day(self, day, nifty, vix, fut, finalize=True):
         self.state = DayState(); self.heartbeat = []; self.log = []; self._prev_trend = None
         self._vix = vix
         mask = nifty.ts.dt.date == day
@@ -572,18 +579,25 @@ class StraddleEngine:
             fr = fut[fut.ts <= now]
             self.on_bar(day, nifty, i, li, now,
                         spot, float(fr.close.iloc[-1]) if not fr.empty else spot)
-        for leg in list(self.state.open_legs):
-            self.exit_leg(leg, leg.entry_price, "FORCED_DAY_END",
-                          dayc.ts.iloc[-1], int(pos[-1]))
+        # Only force-close when the session is actually over. On a mid-session
+        # run these legs are still live — booking them at entry price would
+        # invent zero-P&L exits that never happened.
+        if finalize:
+            for leg in list(self.state.open_legs):
+                self.exit_leg(leg, leg.entry_price, "FORCED_DAY_END",
+                              dayc.ts.iloc[-1], int(pos[-1]))
 
 
 # ============================== RUN ==========================================
-def run_dates(dates, run_type, variants, progress=None):
+def run_dates(dates, run_type, variants, expiry_override=None,
+              finalize=True, progress=None):
     smart = angel_login()
     lookup, expiries = option_universe()
     first, last = min(dates), max(dates)
     frm = dt.datetime.combine(first-dt.timedelta(days=WARMUP_CALENDAR_DAYS), dt.time(9, 15))
-    to = dt.datetime.combine(last, dt.time(15, 30))
+    # Cap at "now" so a mid-session run asks only for candles that exist.
+    # Bars from 09:15 up to the current 3-min boundary are all included.
+    to = min(dt.datetime.combine(last, dt.time(15, 30)), dt.datetime.now())
 
     nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, to)
     vix = candles(smart, INDIA_VIX_TOKEN, NSE, frm, to)
@@ -597,14 +611,14 @@ def run_dates(dates, run_type, variants, progress=None):
         notes.append(f"Only {warm} warm-up bars (want {FULL_WARMUP_BARS}); the Loxx "
                      "squeeze filter will be skipped early in the day.")
 
-    trades, summary, hb, logs = [], [], [], []
+    trades, summary, hb, logs, open_legs = [], [], [], [], []
     cache = {}
     for n, day in enumerate(sorted(dates)):
-        expiry = nearest_expiry(expiries, day)
+        expiry = expiry_override or nearest_expiry(expiries, day)
         engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
                    for nm, dyn, rd, ml in variants]
         for e in engines:
-            e.run_day(day, nifty, vix, fut)
+            e.run_day(day, nifty, vix, fut, finalize=finalize)
             for leg in e.state.closed_legs:
                 pnl = (leg.entry_price-leg.exit_price)*leg.qty if leg.exit_price is not None else 0
                 trades.append([run_type, str(day), e.name, leg.straddle_num, leg.symbol,
@@ -620,124 +634,335 @@ def run_dates(dates, run_type, variants, progress=None):
                             sum(1 for l in e.state.closed_legs
                                 if l.exit_reason == "REVERSAL_EMA_CROSS"),
                             e.state.redeploys])
+            for leg in e.state.open_legs:
+                open_legs.append([e.name, leg.straddle_num, leg.symbol, leg.opt_type,
+                                  leg.strike, leg.entry_time.strftime("%H:%M:%S"),
+                                  round(leg.entry_price, 2), round(leg.sl, 2),
+                                  leg.naked, leg.sl_tightened])
             hb += e.heartbeat
             logs += e.log
         if progress:
             progress.progress((n+1)/len(dates), text=f"{day} ({n+1}/{len(dates)})")
+    O = pd.DataFrame(open_legs, columns=["strategy", "straddle_num", "leg_symbol",
+                                        "opt_type", "strike", "entry_time",
+                                        "entry_price", "sl", "naked", "sl_tightened"])
     return (pd.DataFrame(trades, columns=TRADE_HEADERS),
             pd.DataFrame(summary, columns=SUMMARY_HEADERS),
-            pd.DataFrame(hb, columns=HEARTBEAT_HEADERS)), logs, notes, None
+            pd.DataFrame(hb, columns=HEARTBEAT_HEADERS), O), logs, notes, None
 
 
 # ============================== UI ===========================================
-st.title("NIFTY short straddle")
+# ============================== THEME + HELPERS =============================
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+.stApp { background:#fdf4f8; }
+html, body, [class*="css"] { font-family:'Inter',sans-serif; }
+#MainMenu, footer, header { visibility:hidden; }
+.block-container { padding-top:1.2rem; padding-bottom:2rem; max-width:1500px; }
+
+section[data-testid="stSidebar"] { background:#ffffff; border-right:1px solid #f2e3ec; }
+section[data-testid="stSidebar"] .block-container { padding-top:1.5rem; }
+
+.brand { display:flex; align-items:center; gap:.55rem; padding:.7rem .9rem;
+  background:linear-gradient(135deg,#ec4899,#d946ef); border-radius:12px;
+  color:#fff; font-weight:700; font-size:1.05rem; margin-bottom:1.4rem; }
+
+.panel { background:#fff; border-radius:16px; padding:1.15rem 1.3rem;
+  box-shadow:0 1px 3px rgba(80,20,60,.06); border:1px solid #f6e8f0;
+  margin-bottom:1rem; }
+.panel h4 { margin:0 0 .15rem 0; font-size:1rem; font-weight:600; color:#1f1235; }
+.panel .sub { font-size:.78rem; color:#9b8aa6; }
+
+.kpi { border-radius:16px; padding:1.05rem 1.15rem; color:#fff;
+  box-shadow:0 4px 14px rgba(120,40,90,.16); }
+.kpi .lbl { font-size:.74rem; text-transform:uppercase; letter-spacing:.06em;
+  opacity:.9; font-weight:600; }
+.kpi .val { font-size:1.75rem; font-weight:700; line-height:1.25; margin-top:.2rem; }
+.kpi .fin { font-size:.76rem; opacity:.9; margin-top:.1rem; }
+.g1 { background:linear-gradient(135deg,#ec4899,#f43f5e); }
+.g2 { background:linear-gradient(135deg,#8b5cf6,#6366f1); }
+.g3 { background:linear-gradient(135deg,#0ea5e9,#06b6d4); }
+.g4 { background:linear-gradient(135deg,#f59e0b,#f97316); }
+.gneg { background:linear-gradient(135deg,#64748b,#475569); }
+
+.stat { background:#fff; border-radius:14px; padding:.85rem 1rem;
+  border:1px solid #f6e8f0; }
+.stat .lbl { font-size:.72rem; color:#9b8aa6; text-transform:uppercase;
+  letter-spacing:.05em; font-weight:600; }
+.stat .val { font-size:1.3rem; font-weight:700; color:#1f1235; }
+
+.pill { display:inline-block; padding:.2rem .6rem; border-radius:20px;
+  font-size:.7rem; font-weight:600; }
+.pill-live { background:#dcfce7; color:#15803d; }
+.pill-off  { background:#f1f5f9; color:#64748b; }
+
+.stButton>button { border-radius:10px; font-weight:600; border:none;
+  background:linear-gradient(135deg,#ec4899,#d946ef); color:#fff; padding:.5rem 1.2rem; }
+.stButton>button:hover { filter:brightness(1.07); color:#fff; }
+div[data-testid="stDataFrame"] { border-radius:12px; overflow:hidden;
+  border:1px solid #f0e3ec; }
+</style>
+"""
+
+GRADS = {"FIXED_1_3X": "g1", "DYNAMIC_SL": "g2", "NAKED_CARRY": "g3"}
+
+
+def kpi(label, value, footnote="", grad="g1"):
+    return (f'<div class="kpi {grad}"><div class="lbl">{label}</div>'
+            f'<div class="val">{value}</div><div class="fin">{footnote}</div></div>')
+
+
+def stat(label, value):
+    return f'<div class="stat"><div class="lbl">{label}</div><div class="val">{value}</div></div>'
+
+
+def panel_open(title, sub=""):
+    return f'<div class="panel"><h4>{title}</h4><div class="sub">{sub}</div>'
+
+
+def money(x):
+    try:
+        return f"{float(x):+,.0f}"
+    except Exception:
+        return "-"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def expiries_for(day):
+    _, exp = option_universe()
+    return expiry_choices(exp, day)
+
+
+def equity_chart(S):
+    """Cumulative P&L per variant."""
+    if S.empty:
+        return None
+    d = S.copy()
+    d["total_pnl"] = pd.to_numeric(d.total_pnl, errors="coerce").fillna(0)
+    d["trading_date"] = pd.to_datetime(d.trading_date)
+    d = d.sort_values("trading_date")
+    d["cum"] = d.groupby("strategy").total_pnl.cumsum()
+    return (alt.Chart(d).mark_line(strokeWidth=2.5, point=alt.OverlayMarkDef(size=35))
+            .encode(x=alt.X("trading_date:T", title=None,
+                            axis=alt.Axis(grid=False, labelColor="#9b8aa6")),
+                    y=alt.Y("cum:Q", title="cumulative P&L",
+                            axis=alt.Axis(gridColor="#f4e9f0", labelColor="#9b8aa6")),
+                    color=alt.Color("strategy:N", title=None,
+                                    scale=alt.Scale(domain=list(GRADS),
+                                                    range=["#ec4899", "#8b5cf6", "#0ea5e9"]),
+                                    legend=alt.Legend(orient="top")),
+                    tooltip=["trading_date:T", "strategy:N", "cum:Q", "total_pnl:Q"])
+            .properties(height=260).configure_view(strokeWidth=0))
+
+
+def reason_chart(T):
+    """Exit reasons by count."""
+    if T.empty or "exit_reason" not in T.columns:
+        return None
+    g = T.groupby("exit_reason").size().reset_index(name="n")
+    return (alt.Chart(g).mark_arc(innerRadius=52, stroke="#fff", strokeWidth=2)
+            .encode(theta="n:Q",
+                    color=alt.Color("exit_reason:N", title=None,
+                                    scale=alt.Scale(scheme="purpleorange"),
+                                    legend=alt.Legend(orient="right")),
+                    tooltip=["exit_reason:N", "n:Q"])
+            .properties(height=240).configure_view(strokeWidth=0))
+
+
+st.markdown(CSS, unsafe_allow_html=True)
 
 missing = [k for k in ("angel", "sheets", "gcp_service_account") if k not in st.secrets]
 if missing:
     st.error(f"Missing secrets: {', '.join(missing)}. Add them in Settings → Secrets.")
     st.stop()
-for k, v in SHEET_KEYS.items():
-    if v not in st.secrets["sheets"]:
-        st.error(f"Missing [sheets] {v} in secrets (needed for the {k} tab).")
+for _k, _v in SHEET_KEYS.items():
+    if _v not in st.secrets["sheets"]:
+        st.error(f"Missing [sheets] {_v} in secrets (needed for {_k}).")
         st.stop()
 
+# ---------------- sidebar ----------------
+with st.sidebar:
+    st.markdown('<div class="brand">◆ Straddle Desk</div>', unsafe_allow_html=True)
+    page = st.radio("", ["Live run", "Backtest", "History"], label_visibility="collapsed")
+    st.markdown("---")
+    _now = dt.datetime.now()
+    _over = _now.time() >= dt.time(15, 30)
+    _wk = dt.date.today().weekday() >= 5
+    _pill = ("pill-off", "Closed — weekend") if _wk else             (("pill-off", f"Session over · {_now:%H:%M}") if _over
+             else ("pill-live", f"Session open · {_now:%H:%M}"))
+    st.markdown(f'<span class="pill {_pill[0]}">{_pill[1]}</span>', unsafe_allow_html=True)
+    st.caption(f"Front-month token `{NIFTY_FUT_TOKEN}` — update after each roll.")
+    st.caption(f"Tighten mode: `{TIGHTEN_MODE}`")
 
-def show_results(S, variants):
-    cols = st.columns(len(variants))
+
+def render_kpis(S, variants, sessions_note=""):
+    cols = st.columns(len(variants) + 1)
     for c, v in zip(cols, variants):
         g = S[S.strategy == v[0]]
+        pnl = pd.to_numeric(g.total_pnl, errors="coerce").sum() if not g.empty else 0
+        grad = GRADS.get(v[0], "g1") if pnl >= 0 else "gneg"
+        legs = int(pd.to_numeric(g.num_legs, errors="coerce").sum()) if not g.empty else 0
         with c:
-            st.metric(v[0], f"{pd.to_numeric(g.total_pnl, errors='coerce').sum():+,.0f}"
-                      if not g.empty else "—",
-                      f"{int(g.num_legs.sum())} legs" if not g.empty else "")
+            st.markdown(kpi(v[0].replace("_", " "), money(pnl), f"{legs} legs", grad),
+                        unsafe_allow_html=True)
+    with cols[-1]:
+        n = S.trading_date.nunique() if not S.empty else 0
+        st.markdown(kpi("Sessions", str(n), sessions_note, "g4"), unsafe_allow_html=True)
 
 
-t1, t2 = st.tabs(["Live run", "Backtest"])
+# ---------------- Live run ----------------
+if page == "Live run":
+    st.markdown(panel_open("Live run",
+                "FIXED_1_3X and DYNAMIC_SL · paper only, no orders placed") +
+                "</div>", unsafe_allow_html=True)
+    today = dt.date.today()
+    c1, c2, c3 = st.columns([1.1, 1.1, 1])
+    with c1:
+        st.markdown(stat("Trading day", today.strftime("%d %b %Y")), unsafe_allow_html=True)
+    try:
+        exps = expiries_for(today)
+    except Exception as e:
+        st.error(f"Could not load expiries: {e}"); st.stop()
+    with c2:
+        exp_live = st.selectbox("Expiry", exps,
+                                format_func=lambda d: f"{d:%d %b %Y} · {(d-today).days}d",
+                                key="exp_live")
+    session_over = dt.datetime.now().time() >= dt.time(15, 30)
+    with c3:
+        st.write("")
+        go = st.button("Run session", type="primary", use_container_width=True)
 
-with t1:
-    st.caption("FIXED_1_3X and DYNAMIC_SL. Run after 15:30 IST — no orders are placed. "
-               "The engine only uses completed candles, so replaying the finished "
-               "session gives the same trades a 3-minute poller would have produced.")
-    day = st.date_input("Session", value=dt.date.today(), max_value=dt.date.today())
-    if day.weekday() >= 5:
+    if today.weekday() >= 5:
         st.warning("Weekend — no session.")
-    c1, c2 = st.columns([1, 3])
-    if c1.button("Run day", type="primary", use_container_width=True):
-        p = st.progress(0.0, text="starting")
+    elif not session_over:
+        st.info(f"Session still open. Results are provisional and nothing is written "
+                f"to the sheet until you run after 15:30.")
+
+    if go:
+        p = st.progress(0.0, text="fetching")
         try:
-            out, logs, notes, err = run_dates([day], "LIVE", VARIANTS_LIVE, p)
+            out, logs, notes, err = run_dates([today], "LIVE", VARIANTS_LIVE,
+                                              expiry_override=exp_live,
+                                              finalize=session_over, progress=p)
             p.empty()
             if err:
                 st.error(err)
             else:
-                T, S, H = out
+                T, S, H, O = out
                 for n in notes:
                     st.warning(n)
-                if T.empty:
-                    st.info(f"{day}: no trades — entry conditions were not met.")
-                else:
+                if not S.empty:
+                    render_kpis(S, VARIANTS_LIVE, today.strftime("%d %b"))
+                if not O.empty:
+                    st.markdown(panel_open("Still open",
+                                "session unfinished — not written to the sheet") +
+                                "</div>", unsafe_allow_html=True)
+                    st.dataframe(O, use_container_width=True, hide_index=True)
+                if not T.empty:
+                    a, b = st.columns([2, 1])
+                    with a:
+                        st.markdown(panel_open("Closed legs") + "</div>",
+                                    unsafe_allow_html=True)
+                        st.dataframe(T.drop(columns=["run_type"]),
+                                     use_container_width=True, hide_index=True)
+                    with b:
+                        ch = reason_chart(T)
+                        if ch is not None:
+                            st.markdown(panel_open("Exit reasons") + "</div>",
+                                        unsafe_allow_html=True)
+                            st.altair_chart(ch, use_container_width=True)
+                if T.empty and O.empty:
+                    st.info("No trades — entry conditions not met.")
+
+                if session_over and not T.empty:
                     append_rows("LIVE", TAB_TRADES, TRADE_HEADERS, T.values.tolist())
                     append_rows("LIVE", TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
                     if not H.empty:
                         append_rows("LIVE", TAB_HEARTBEAT, HEARTBEAT_HEADERS, H.values.tolist())
-                    st.success(f"{day}: {len(T)} legs written to the live sheet")
-                    show_results(S, VARIANTS_LIVE)
-                    st.dataframe(T, use_container_width=True, hide_index=True)
+                    st.success(f"{len(T)} legs written to the live sheet.")
                 with st.expander("Engine log"):
                     st.code("\n".join(logs) or "(nothing)")
         except Exception as e:
             p.empty(); st.error(f"{type(e).__name__}: {e}")
 
-    st.divider()
-    if st.button("Load live history"):
-        S = read_tab("LIVE", TAB_SUMMARY)
-        if S.empty:
-            st.info("Nothing recorded yet.")
-        else:
-            S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
-            st.caption(f"{S.trading_date.nunique()} sessions recorded")
-            show_results(S, VARIANTS_LIVE)
-            st.dataframe(S.tail(60), use_container_width=True, hide_index=True)
-            st.download_button("Download live summary", S.to_csv(index=False),
-                               "live_summary.csv", "text/csv")
-
-with t2:
-    st.caption("FIXED_1_3X, DYNAMIC_SL and NAKED_CARRY over a date range, off one "
-               "shared feed. Weekly option contracts are purged after expiry, so "
-               "distant history may return no option candles.")
-    c1, c2 = st.columns(2)
-    d1 = c1.date_input("From", value=dt.date.today()-dt.timedelta(days=7), key="bt_from")
-    d2 = c2.date_input("To", value=dt.date.today(), key="bt_to")
-    save = st.checkbox("Write to the backtest sheet", value=False)
-    if st.button("Run backtest", type="primary"):
+# ---------------- Backtest ----------------
+elif page == "Backtest":
+    st.markdown(panel_open("Backtest",
+                "FIXED_1_3X · DYNAMIC_SL · NAKED_CARRY — one shared data feed") +
+                "</div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    mode = c1.radio("Range", ["Single day", "Date range"], key="bt_mode")
+    if mode == "Single day":
+        bt_day = c2.date_input("Trading day", value=dt.date.today(), key="bt_day")
+        days = [bt_day] if bt_day.weekday() < 5 else []
+        ref = bt_day
+    else:
+        d1 = c2.date_input("From", value=dt.date.today()-dt.timedelta(days=7), key="bt_from")
+        d2 = c3.date_input("To", value=dt.date.today(), key="bt_to")
         days = [d for d in (d1+dt.timedelta(days=k) for k in range((d2-d1).days+1))
                 if d.weekday() < 5]
+        ref = d1
+    try:
+        bexps = expiries_for(ref)
+    except Exception as e:
+        st.error(f"Could not load expiries: {e}"); st.stop()
+    c4, c5, c6 = st.columns([1.2, 1.2, 1])
+    auto = c4.checkbox("Nearest expiry per day", value=True,
+                       help="Uncheck to force one expiry across the range.")
+    exp_bt = None if auto else c5.selectbox("Expiry", bexps,
+                                            format_func=lambda d: f"{d:%d %b %Y}",
+                                            key="exp_bt")
+    save = c6.checkbox("Save to sheet", value=False)
+    if st.button("Run backtest", type="primary"):
         if not days:
-            st.warning("No weekdays in that range.")
+            st.warning("No weekdays selected.")
         else:
-            p = st.progress(0.0, text="starting")
+            p = st.progress(0.0, text="fetching")
             try:
-                out, logs, notes, err = run_dates(days, "BACKTEST", VARIANTS_BACKTEST, p)
+                out, logs, notes, err = run_dates(days, "BACKTEST", VARIANTS_BACKTEST,
+                                                  expiry_override=exp_bt,
+                                                  finalize=True, progress=p)
                 p.empty()
                 if err:
                     st.error(err)
                 else:
-                    T, S, H = out
+                    T, S, H, O = out
                     for n in notes:
                         st.warning(n)
                     if S.empty:
                         st.info("No trades over that range.")
                     else:
-                        show_results(S, VARIANTS_BACKTEST)
-                        st.dataframe(S, use_container_width=True, hide_index=True)
-                        st.download_button("Download trades", T.to_csv(index=False),
-                                           "straddle_trades.csv", "text/csv")
+                        render_kpis(S, VARIANTS_BACKTEST, f"{len(days)} weekdays")
+                        a, b = st.columns([2, 1])
+                        with a:
+                            ch = equity_chart(S)
+                            if ch is not None:
+                                st.markdown(panel_open("Cumulative P&L") + "</div>",
+                                            unsafe_allow_html=True)
+                                st.altair_chart(ch, use_container_width=True)
+                        with b:
+                            rc = reason_chart(T)
+                            if rc is not None:
+                                st.markdown(panel_open("Exit reasons") + "</div>",
+                                            unsafe_allow_html=True)
+                                st.altair_chart(rc, use_container_width=True)
+                        st.markdown(panel_open("Per-session summary") + "</div>",
+                                    unsafe_allow_html=True)
+                        st.dataframe(S.drop(columns=["run_type"]),
+                                     use_container_width=True, hide_index=True)
+                        d1_, d2_ = st.columns(2)
+                        d1_.download_button("Download trades", T.to_csv(index=False),
+                                            "straddle_trades.csv", "text/csv",
+                                            use_container_width=True)
                         if not H.empty:
                             fired = (H.trend.astype(str) != "").sum()
                             st.caption(f"Heartbeat: {len(H)} bars evaluated, "
                                        f"trend fired on {fired}.")
-                            st.download_button("Download heartbeat", H.to_csv(index=False),
-                                               "straddle_heartbeat.csv", "text/csv")
+                            d2_.download_button("Download heartbeat", H.to_csv(index=False),
+                                                "straddle_heartbeat.csv", "text/csv",
+                                                use_container_width=True)
                         if save:
                             append_rows("BACKTEST", TAB_TRADES, TRADE_HEADERS, T.values.tolist())
                             append_rows("BACKTEST", TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
@@ -749,3 +974,26 @@ with t2:
                         st.code("\n".join(logs) or "(nothing)")
             except Exception as e:
                 p.empty(); st.error(f"{type(e).__name__}: {e}")
+
+# ---------------- History ----------------
+else:
+    st.markdown(panel_open("History", "accumulated live paper record") + "</div>",
+                unsafe_allow_html=True)
+    src = st.radio("Source", ["Live", "Backtest"], horizontal=True)
+    kind = "LIVE" if src == "Live" else "BACKTEST"
+    variants = VARIANTS_LIVE if kind == "LIVE" else VARIANTS_BACKTEST
+    if st.button("Load"):
+        S = read_tab(kind, TAB_SUMMARY)
+        if S.empty:
+            st.info("Nothing recorded yet.")
+        else:
+            S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
+            render_kpis(S, variants, f"{S.trading_date.nunique()} recorded")
+            ch = equity_chart(S)
+            if ch is not None:
+                st.markdown(panel_open("Cumulative P&L") + "</div>", unsafe_allow_html=True)
+                st.altair_chart(ch, use_container_width=True)
+            st.markdown(panel_open("Sessions") + "</div>", unsafe_allow_html=True)
+            st.dataframe(S.tail(80), use_container_width=True, hide_index=True)
+            st.download_button("Download summary", S.to_csv(index=False),
+                               f"{kind.lower()}_summary.csv", "text/csv")
