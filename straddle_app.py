@@ -43,6 +43,7 @@ Never put credentials in the repo.
 
 import datetime as dt
 import time
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 
 import altair as alt
@@ -54,6 +55,20 @@ st.set_page_config(page_title="Straddle Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="expanded")
 
 # ============================== CONSTANTS ===================================
+# Streamlit Cloud runs in UTC. Every time decision here — session state, the
+# candle-fetch cap, "today" — must be IST or the app silently asks the broker
+# for the wrong window and finds no data.
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist():
+    return dt.datetime.now(IST).replace(tzinfo=None)
+
+
+def today_ist():
+    return dt.datetime.now(IST).date()
+
+
 NIFTY_INDEX_TOKEN = "99926000"
 NIFTY_FUT_TOKEN = "68407"          # front month — update after each roll
 INDIA_VIX_TOKEN = "99926017"
@@ -102,6 +117,7 @@ VARIANTS_BACKTEST = [FIXED, DYNAMIC, NAKED]      # backtest
 TAB_TRADES = "Straddle_Trades"
 TAB_SUMMARY = "Straddle_Summary"
 TAB_HEARTBEAT = "Straddle_Heartbeat"
+TAB_SNAPSHOT = "Straddle_Snapshots"
 
 TRADE_HEADERS = ["run_type", "trading_date", "strategy", "straddle_num", "leg_symbol",
                  "opt_type", "strike", "entry_time", "exit_time", "entry_price",
@@ -109,6 +125,8 @@ TRADE_HEADERS = ["run_type", "trading_date", "strategy", "straddle_num", "leg_sy
                  "sl_tightened", "carry_bars"]
 SUMMARY_HEADERS = ["run_type", "strategy", "trading_date", "total_pnl", "num_legs",
                    "num_straddles", "naked_legs", "reversal_exits", "redeploys"]
+SNAP_HEADERS = ["snapshot_at", "trading_date", "strategy", "realised_pnl",
+                "closed_legs", "open_legs", "straddles", "detail"]
 HEARTBEAT_HEADERS = ["trading_date", "bar_time", "spot", "adx", "adxr", "chop",
                      "loxx_width", "loxx_width_avg", "width_ok", "momentum",
                      "loxx_up", "loxx_dn", "kc_break_up", "kc_break_dn", "trend"]
@@ -172,6 +190,22 @@ def append_rows(kind, tab, headers, rows):
         ws.append_row(headers)
     ws.append_rows([[_j(v) for v in r] for r in rows], value_input_option="USER_ENTERED")
     return len(rows)
+
+
+def write_snapshot(T, S, O, day, stamp):
+    """A row per strategy per snapshot, so an intraday poll leaves a trail
+    without touching the end-of-day record in Straddle_Summary."""
+    rows = []
+    for v in VARIANTS_LIVE:
+        nm = v[0]
+        ts_ = T[T.strategy == nm] if not T.empty else T
+        os_ = O[O.strategy == nm] if not O.empty else O
+        pnl = pd.to_numeric(ts_.pnl, errors="coerce").sum() if not ts_.empty else 0
+        det = "; ".join(f"{r.leg_symbol}@{r.entry_price}" for r in os_.itertuples()) \
+              if not os_.empty else ""
+        rows.append([stamp, str(day), nm, round(float(pnl), 2), len(ts_), len(os_),
+                     int(ts_.straddle_num.max()) if not ts_.empty else 0, det])
+    return append_rows("LIVE", TAB_SNAPSHOT, SNAP_HEADERS, rows)
 
 
 def read_tab(kind, tab):
@@ -595,9 +629,10 @@ def run_dates(dates, run_type, variants, expiry_override=None,
     lookup, expiries = option_universe()
     first, last = min(dates), max(dates)
     frm = dt.datetime.combine(first-dt.timedelta(days=WARMUP_CALENDAR_DAYS), dt.time(9, 15))
-    # Cap at "now" so a mid-session run asks only for candles that exist.
-    # Bars from 09:15 up to the current 3-min boundary are all included.
-    to = min(dt.datetime.combine(last, dt.time(15, 30)), dt.datetime.now())
+    # Cap at IST "now" so a mid-session run asks only for candles that exist.
+    # Using a UTC clock here would request a window 5h30m in the past and
+    # come back nearly empty.
+    to = min(dt.datetime.combine(last, dt.time(15, 30)), now_ist())
 
     nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, to)
     vix = candles(smart, INDIA_VIX_TOKEN, NSE, frm, to)
@@ -796,7 +831,7 @@ def empty_state(title, sub, ico="◇"):
 
 def header(title, tag, live):
     dot = "dot-live" if live else "dot-off"
-    txt = f"Session open · {dt.datetime.now():%H:%M}" if live else           f"Session closed · {dt.datetime.now():%H:%M}"
+    txt = f"Session open · {now_ist():%H:%M}" if live else           f"Session closed · {now_ist():%H:%M}"
     return (f'<div class="hdr"><div><h1>{title}</h1><div class="tag">{tag}</div></div>'
             f'<div class="chip"><span class="dot {dot}"></span>{txt}</div></div>')
 
@@ -861,8 +896,8 @@ for _k, _v in SHEET_KEYS.items():
         st.error(f"Missing [sheets] {_v} in secrets (needed for {_k}).")
         st.stop()
 
-TODAY = dt.date.today()
-NOW = dt.datetime.now()
+TODAY = today_ist()
+NOW = now_ist()
 SESSION_LIVE = (TODAY.weekday() < 5 and dt.time(9, 15) <= NOW.time() < dt.time(15, 30))
 SESSION_OVER = NOW.time() >= dt.time(15, 30)
 
@@ -965,11 +1000,26 @@ if page == "Live run":
 
     if TODAY.weekday() >= 5:
         st.info("Weekend — no session to run.")
+    elif SESSION_LIVE:
+        st.info(f"Session open · {NOW:%H:%M} IST. Each run processes every completed "
+                "bar from 09:15 to now. The daily record is written after 15:30.")
     elif not SESSION_OVER:
-        st.info("Session still open. Results are provisional and nothing is written "
-                "to the sheet until you run after 15:30.")
+        st.info(f"Pre-market · {NOW:%H:%M} IST.")
 
-    if go:
+    ac1, ac2 = st.columns([1.4, 1])
+    snap = ac1.checkbox("Log each run to Straddle_Snapshots", value=SESSION_LIVE,
+                        help="Appends a timestamped row per strategy so intraday "
+                             "polls leave a trail without touching the daily record.")
+    auto = ac2.checkbox("Auto-refresh", value=False,
+                        help="Re-runs while this tab stays open and awake. "
+                             "Streamlit Cloud sleeps on inactivity, so this is not "
+                             "unattended logging.")
+    if auto and SESSION_LIVE:
+        every = st.select_slider("Refresh every", [3, 5, 10, 15], value=3,
+                                 format_func=lambda m: f"{m} min")
+        st.caption(f"Next refresh in ~{every} min. Keep this tab open.")
+
+    if go or (auto and SESSION_LIVE):
         p = st.progress(0.0, text="fetching candles")
         try:
             out, logs, notes, err = run_dates([TODAY], "LIVE", VARIANTS_LIVE,
@@ -983,10 +1033,19 @@ if page == "Live run":
                 for n in notes:
                     st.warning(n)
                 render_run(T, S, H, O, VARIANTS_LIVE, "LIVE", SESSION_OVER)
+                if snap and not SESSION_OVER:
+                    try:
+                        n = write_snapshot(T, S, O, TODAY, NOW.strftime("%Y-%m-%d %H:%M:%S"))
+                        st.caption(f"{n} snapshot row(s) appended at {NOW:%H:%M} IST.")
+                    except Exception as e:
+                        st.warning(f"Snapshot write failed: {e}")
                 with st.expander("Engine log"):
                     st.code("\n".join(logs) or "(nothing)")
         except Exception as e:
             p.empty(); st.error(f"{type(e).__name__}: {e}")
+        if auto and SESSION_LIVE:
+            time.sleep(int(every) * 60)
+            st.rerun()
     else:
         try:
             S = read_tab("LIVE", TAB_SUMMARY)
