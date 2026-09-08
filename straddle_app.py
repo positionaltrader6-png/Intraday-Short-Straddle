@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 import altair as alt
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Straddle Desk", page_icon="◆", layout="wide",
@@ -230,6 +231,35 @@ def read_tab(kind, tab):
 
 
 # ============================== MARKET DATA =================================
+# ============================== DISCORD =====================================
+def discord_url():
+    try:
+        return st.secrets["discord"]["webhook"]
+    except Exception:
+        return None
+
+
+def discord(msg, tag=""):
+    """Fire-and-forget notification. A webhook failure must never interrupt
+    the engine, so every error is swallowed after one retry."""
+    url = discord_url()
+    if not url:
+        return False
+    body = {"content": (f"{tag} " if tag else "") + msg}
+    for attempt in range(2):
+        try:
+            r = requests.post(url, json=body, timeout=6)
+            if r.status_code in (200, 204):
+                return True
+            if r.status_code == 429:          # rate limited
+                time.sleep(float(r.headers.get("Retry-After", 2)))
+                continue
+            return False
+        except Exception:
+            time.sleep(1)
+    return False
+
+
 CANDLE_COLS = ["ts", "open", "high", "low", "close", "volume"]
 
 
@@ -414,6 +444,9 @@ class StraddleEngine:
         self._prev_trend = None
         self._diag = None
         self.log = []
+        self.notify = False          # only the live engine turns this on
+        self._logged = set()
+        self.last_ts = None
 
     # ---- data ----
     def option_df(self, day, strike, ot):
@@ -519,6 +552,14 @@ class StraddleEngine:
                                             LOT_SIZE, now, idx, straddle_num=n))
         self.log.append(f"{self.name}: {tag} straddle #{n} @ {now:%H:%M} strike {strike} "
                         f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f}")
+        if self.notify:
+            ce, pe = legs[0], legs[1]
+            discord(
+                f"**{self.name}** — {tag} straddle #{n}\n"
+                f"`{now:%H:%M}`  strike **{strike}**  (spot {spot:.1f})\n"
+                f"SELL `{ce[0]}` @ **{ce[2]:.2f}**  ·  SL {ce[2]*SL_MULTIPLIER:.2f}\n"
+                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*SL_MULTIPLIER:.2f}",
+                tag="🟢")
         return True
 
     def sl_fill(self, leg, day, now):
@@ -546,8 +587,25 @@ class StraddleEngine:
         leg.exit_reason = reason; leg.exit_idx = idx
         self.state.open_legs.remove(leg)
         self.state.closed_legs.append(leg)
+        pnl = (leg.entry_price - px) * leg.qty
         self.log.append(f"{self.name}: exit {leg.symbol} @ {px:.2f} ({reason}) "
-                        f"pnl {(leg.entry_price-px)*leg.qty:+.0f}")
+                        f"pnl {pnl:+.0f}")
+        if self.notify:
+            icon = {"SL_HIT": "🔴", "NAKED_SL_HIT": "🔴",
+                    "REVERSAL_EMA_CROSS": "🟡", "EOD_15_10": "⚪",
+                    "FORCED_DAY_END": "⚪"}.get(reason, "🔵")
+            extra = ""
+            if leg.naked:
+                extra += f"  ·  carried naked {leg.carry_bars} bars"
+            if leg.sl_tightened:
+                extra += "  ·  SL was tightened"
+            discord(
+                f"**{self.name}** — exit  ({reason})\n"
+                f"`{now:%H:%M}`  `{leg.symbol}`\n"
+                f"entry {leg.entry_price:.2f} → exit **{px:.2f}**  ·  "
+                f"SL {leg.sl:.2f}\n"
+                f"P&L **{pnl:+,.0f}**  ·  day total {self.state.pnl() + pnl:+,.0f}{extra}",
+                tag=icon)
 
     def partner(self, leg):
         c = [l for l in self.state.open_legs
@@ -594,6 +652,11 @@ class StraddleEngine:
                         leg.sl_tightened = True
                         self.log.append(f"{self.name}: {leg.symbol} SL -> {leg.sl:.2f} "
                                         f"(trend {trend}, straddle #{leg.straddle_num})")
+                        if self.notify:
+                            discord(f"**{self.name}** — SL tightened\n"
+                                    f"`{now:%H:%M}`  `{leg.symbol}`\n"
+                                    f"SL {leg.entry_price*SL_MULTIPLIER:.2f} → "
+                                    f"**{leg.sl:.2f}**  (trend {trend})", tag="🟠")
 
         for leg in list(self.state.open_legs):
             fill = self.sl_fill(leg, day, now)
@@ -603,6 +666,10 @@ class StraddleEngine:
                 if p:
                     p.naked = True; p.naked_since = i
                     self.log.append(f"{self.name}: {p.symbol} now naked")
+                    if self.notify:
+                        discord(f"**{self.name}** — leg now naked\n"
+                                f"`{now:%H:%M}`  `{p.symbol}`  entry {p.entry_price:.2f}  "
+                                f"SL {p.sl:.2f}", tag="⚠️")
                 if self.redeploy_mode == REDEPLOY_IMMEDIATE \
                         and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
                     self.deploy(day, spot, fut, now, i)
@@ -779,7 +846,7 @@ def _replace_open_positions(sh_rows, day):
               value_input_option="USER_ENTERED")
 
 
-def live_engine_loop(stop_event, expiry, status):
+def live_engine_loop(stop_event, expiry, status, notify_on=False):
     """Runs in a daemon thread, so it survives the browser closing and keeps
     ticking until the container is recycled or the market closes.
 
@@ -803,10 +870,16 @@ def live_engine_loop(stop_event, expiry, status):
                    for nm, dyn, rd, ml in VARIANTS_LIVE]
         for e in engines:
             e.prepare(day)
+            e.notify = notify_on
         note(f"engine up · expiry {expiry} · {len(engines)} variants")
+        if notify_on:
+            discord(f"**Straddle Desk started**\n`{day}`  expiry `{expiry}`\n"
+                    f"variants: {', '.join(e.name for e in engines)}", tag="🚀")
     except Exception as e:
         status["state"] = "failed"
         note(f"startup failed: {type(e).__name__}: {e}")
+        if notify_on:
+            discord(f"**Startup failed**\n`{type(e).__name__}: {e}`", tag="❌")
         return
 
     status["state"] = "running"
@@ -827,6 +900,8 @@ def live_engine_loop(stop_event, expiry, status):
             if stop_event.is_set():
                 note("stopped from the dashboard")
                 status["state"] = "stopped"
+                if notify_on:
+                    discord("**Engine stopped from the dashboard**", tag="🛑")
                 return
             time.sleep(1)
 
@@ -919,6 +994,11 @@ def live_engine_loop(stop_event, expiry, status):
         _replace_open_positions([], day)
         note("daily summary written")
         status["state"] = "finished"
+        if notify_on:
+            lines = [f"**{e.name}**  {e.state.pnl():+,.0f}  "
+                     f"({len(e.state.closed_legs)} legs, "
+                     f"{e.state.straddle_count} straddles)" for e in engines]
+            discord(f"**Session complete** `{day}`\n" + "\n".join(lines), tag="🏁")
     except Exception as e:
         note(f"final write failed: {type(e).__name__}: {e}")
         status["state"] = "finished_with_errors"
@@ -1066,10 +1146,13 @@ def empty_state(title, sub, ico="◇"):
             f'<div class="t">{title}</div><div class="s">{sub}</div></div></div>')
 
 
-def header(title, tag, live):
+def header(title, tag="", live=False):
+    """tag is accepted and ignored — the header subtitle was removed on
+    request. Kept in the signature so existing call sites still work."""
     dot = "dot-live" if live else "dot-off"
-    txt = f"Session open · {now_ist():%H:%M}" if live else           f"Session closed · {now_ist():%H:%M}"
-    return (f'<div class="hdr"><div><h1>{title}</h1><div class="tag">{tag}</div></div>'
+    when = f"{now_ist():%H:%M}"
+    txt = f"Session open · {when}" if live else f"Session closed · {when}"
+    return (f'<div class="hdr"><div><h1>{title}</h1></div>'
             f'<div class="chip"><span class="dot {dot}"></span>{txt}</div></div>')
 
 
@@ -1158,6 +1241,22 @@ with st.sidebar:
         f'<b>{ENTRY_START:%H:%M}-{ENTRY_END:%H:%M}</b></div>'
         f'<div class="side-kv"><span>Hard exit</span><b>{HARD_EXIT:%H:%M}</b></div>',
         unsafe_allow_html=True)
+    st.markdown('<div class="side-sep"></div><div class="side-lbl">Alerts</div>',
+                unsafe_allow_html=True)
+    _hook = discord_url()
+    if _hook:
+        notify_on = st.checkbox("Discord notifications", value=True,
+                                help="Entry, exit, SL tightened, leg naked, "
+                                     "plus engine start and session summary.")
+        if st.button("Send test"):
+            ok = discord(f"Test from Straddle Desk · {now_ist():%d %b %H:%M} IST",
+                         tag="🔔")
+            st.success("Sent — check the channel.") if ok else \
+                st.error("Failed. Check the webhook URL in secrets.")
+    else:
+        notify_on = False
+        st.caption("No webhook configured. Add `[discord] webhook = \"...\"` "
+                   "to secrets.")
     st.markdown('<div class="side-sep"></div>', unsafe_allow_html=True)
     st.caption("Paper only. No orders are ever placed.")
 
@@ -1251,7 +1350,7 @@ if page == "Live run":
                 st.session_state.engine_status = {"state": "starting", "log": []}
                 th = threading.Thread(target=live_engine_loop,
                                       args=(st.session_state.stop_event, exp_live,
-                                            st.session_state.engine_status),
+                                            st.session_state.engine_status, notify_on),
                                       daemon=True)
                 th.start()
                 st.session_state.engine_thread = th
@@ -1273,11 +1372,6 @@ if page == "Live run":
         st.info(f"Engine {state.replace('_', ' ')}. Daily summary written.")
     elif state == "failed":
         st.error("Engine failed to start — see the log below.")
-    elif TODAY.weekday() >= 5:
-        st.info("Weekend — no session.")
-    else:
-        st.info(f"Engine idle · {NOW:%H:%M} IST. Start it any time during the session; "
-                "it processes every completed bar from 09:15 onward.")
 
     summ = status.get("summary")
     if summ:
