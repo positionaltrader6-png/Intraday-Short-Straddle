@@ -42,6 +42,7 @@ Never put credentials in the repo.
 """
 
 import datetime as dt
+import threading
 import time
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
@@ -118,6 +119,16 @@ TAB_TRADES = "Straddle_Trades"
 TAB_SUMMARY = "Straddle_Summary"
 TAB_HEARTBEAT = "Straddle_Heartbeat"
 TAB_SNAPSHOT = "Straddle_Snapshots"
+TAB_OPEN = "Straddle_Open_Positions"
+
+OPEN_HEADERS = ["strategy", "trading_date", "straddle_num", "leg_symbol", "opt_type",
+                "strike", "entry_time", "entry_price", "sl", "naked", "naked_since",
+                "sl_tightened"]
+
+MARKET_OPEN = dt.time(9, 15)
+MARKET_CLOSE = dt.time(15, 30)
+CANDLE_MIN = 3
+POLL_BUFFER_SEC = 15
 
 TRADE_HEADERS = ["run_type", "trading_date", "strategy", "straddle_num", "leg_symbol",
                  "opt_type", "strike", "entry_time", "exit_time", "entry_price",
@@ -219,6 +230,16 @@ def read_tab(kind, tab):
 
 
 # ============================== MARKET DATA =================================
+CANDLE_COLS = ["ts", "open", "high", "low", "close", "volume"]
+
+
+def empty_candles():
+    """An empty frame WITH the expected columns. A bare pd.DataFrame() has no
+    columns, so downstream `.ts` access raises AttributeError instead of just
+    being empty — which is how a failed VIX or futures fetch used to crash a run."""
+    return pd.DataFrame(columns=CANDLE_COLS)
+
+
 def candles(smart, token, exchange, frm, to):
     p = {"exchange": exchange, "symboltoken": str(token), "interval": INTERVAL,
          "fromdate": frm.strftime("%Y-%m-%d %H:%M"), "todate": to.strftime("%Y-%m-%d %H:%M")}
@@ -229,11 +250,11 @@ def candles(smart, token, exchange, frm, to):
             time.sleep(API_SLEEP * 4 ** a); continue
         time.sleep(API_SLEEP)
         if r.get("status") and r.get("data"):
-            df = pd.DataFrame(r["data"], columns=["ts", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(r["data"], columns=CANDLE_COLS)
             df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize(None)
             return df
         time.sleep(API_SLEEP * 4 ** a)
-    return pd.DataFrame()
+    return empty_candles()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -417,6 +438,8 @@ class StraddleEngine:
         if i < ADX_PERIOD*2:
             return False
         adx, adxr, _, _ = compute_adx_adxr(nifty.iloc[: i+1], ADX_PERIOD)
+        if vix is None or vix.empty or "ts" not in vix.columns:
+            return False
         vr = vix[vix.ts <= nifty.ts.iloc[i]]
         if vr.empty:
             return False
@@ -545,6 +568,8 @@ class StraddleEngine:
 
     # ---- one bar ----
     def on_bar(self, day, nifty, i, local_i, now, spot, fut):
+        """local_i is unused; kept so run_day and the threaded engine
+        can call this identically."""
         if now.time() >= HARD_EXIT and not self.state.done:
             for leg in list(self.state.open_legs):
                 _, df = self.option_df(day, leg.strike, leg.opt_type)
@@ -599,6 +624,41 @@ class StraddleEngine:
             if self.entry_ok(nifty.iloc[: i+1], self._vix, i, now):
                 self.deploy(day, spot, fut, now, i)
 
+    def prepare(self, day):
+        """Reset for a fresh session. Used by the threaded live engine, which
+        then feeds bars in one at a time rather than replaying the day."""
+        self.state = DayState()
+        self.heartbeat = []
+        self.log = []
+        self._prev_trend = None
+        self._logged = set()
+        self.last_ts = None
+
+    def new_closed_rows(self, day, run_type="LIVE"):
+        """Legs closed since the last call, ready for the sheet. Keyed so a
+        repeated call cannot write the same leg twice."""
+        rows = []
+        for leg in self.state.closed_legs:
+            k = f"{leg.symbol}|{leg.entry_time}|{leg.exit_time}"
+            if k in self._logged:
+                continue
+            self._logged.add(k)
+            pnl = (leg.entry_price-leg.exit_price)*leg.qty if leg.exit_price is not None else 0
+            rows.append([run_type, str(day), self.name, leg.straddle_num, leg.symbol,
+                         leg.opt_type, leg.strike, leg.entry_time.strftime("%H:%M:%S"),
+                         leg.exit_time.strftime("%H:%M:%S") if leg.exit_time else "",
+                         round(leg.entry_price, 2),
+                         round(leg.exit_price, 2) if leg.exit_price is not None else "",
+                         round(leg.sl, 2), leg.qty, leg.exit_reason, round(pnl, 2),
+                         leg.naked, leg.sl_tightened, leg.carry_bars])
+        return rows
+
+    def open_rows(self, day):
+        return [[self.name, str(day), l.straddle_num, l.symbol, l.opt_type, l.strike,
+                 l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
+                 round(l.sl, 2), l.naked, l.naked_since if l.naked_since is not None else "",
+                 l.sl_tightened] for l in self.state.open_legs]
+
     def run_day(self, day, nifty, vix, fut, finalize=True):
         self.state = DayState(); self.heartbeat = []; self.log = []; self._prev_trend = None
         self._vix = vix
@@ -610,7 +670,8 @@ class StraddleEngine:
         for li in range(len(dayc)):
             i = int(pos[li]); now = dayc.ts.iloc[li]
             spot = float(dayc.close.iloc[li])
-            fr = fut[fut.ts <= now]
+            fr = fut[fut.ts <= now] if ("ts" in fut.columns and not fut.empty) \
+                else empty_candles()
             self.on_bar(day, nifty, i, li, now,
                         spot, float(fr.close.iloc[-1]) if not fr.empty else spot)
         # Only force-close when the session is actually over. On a mid-session
@@ -642,6 +703,12 @@ def run_dates(dates, run_type, variants, expiry_override=None,
 
     warm = int((nifty.ts.dt.date < first).sum())
     notes = []
+    if vix.empty:
+        notes.append("India VIX returned no candles — the VIX entry filter cannot pass, "
+                     "so no trades will be taken. Check the VIX token.")
+    if fut.empty:
+        notes.append("NIFTY futures returned no candles — Monday strike selection will "
+                     "fall back to spot. Check NIFTY_FUT_TOKEN after each roll.")
     if warm < FULL_WARMUP_BARS:
         notes.append(f"Only {warm} warm-up bars (want {FULL_WARMUP_BARS}); the Loxx "
                      "squeeze filter will be skipped early in the day.")
@@ -687,6 +754,176 @@ def run_dates(dates, run_type, variants, expiry_override=None,
 
 
 # ============================== UI ===========================================
+# ============================== THREADED LIVE ENGINE ========================
+def _seconds_to_next_bar(now):
+    """Sleep target: the next 3-minute boundary plus a buffer, so the bar has
+    actually closed broker-side before we ask for it."""
+    secs = (CANDLE_MIN - (now.minute % CANDLE_MIN)) * 60 - now.second
+    if secs <= 0:
+        secs = CANDLE_MIN * 60
+    return secs + POLL_BUFFER_SEC
+
+
+def _replace_open_positions(sh_rows, day):
+    """The open-positions tab mirrors current state, so it is rewritten whole
+    rather than appended to. On a container restart it is what tells the engine
+    what was live."""
+    import gspread
+    sh = sheet("LIVE")
+    try:
+        ws = sh.worksheet(TAB_OPEN)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TAB_OPEN, rows=200, cols=len(OPEN_HEADERS))
+    ws.update(values=[OPEN_HEADERS] + [[_j(v) for v in r] for r in sh_rows],
+              value_input_option="USER_ENTERED")
+
+
+def live_engine_loop(stop_event, expiry, status):
+    """Runs in a daemon thread, so it survives the browser closing and keeps
+    ticking until the container is recycled or the market closes.
+
+    Each cycle fetches candles up to now, feeds only bars not yet seen into
+    each engine, then flushes newly closed legs and a snapshot to Sheets.
+    Engines hold their state in this thread's locals — nothing depends on
+    Streamlit session state, which is per-browser-session and would be lost.
+    """
+    day = today_ist()
+    status["state"] = "starting"
+    status["log"] = []
+
+    def note(msg):
+        status["log"] = (status.get("log", []) + [f"{now_ist():%H:%M:%S}  {msg}"])[-60:]
+
+    try:
+        smart = angel_login()
+        lookup, _ = option_universe()
+        cache = {}
+        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
+                   for nm, dyn, rd, ml in VARIANTS_LIVE]
+        for e in engines:
+            e.prepare(day)
+        note(f"engine up · expiry {expiry} · {len(engines)} variants")
+    except Exception as e:
+        status["state"] = "failed"
+        note(f"startup failed: {type(e).__name__}: {e}")
+        return
+
+    status["state"] = "running"
+    last_ts = None
+
+    while not stop_event.is_set():
+        now = now_ist()
+        if now.time() < MARKET_OPEN:
+            time.sleep(20)
+            continue
+        if now.time() >= MARKET_CLOSE:
+            note("market closed — finalising")
+            break
+
+        # wait for the next completed bar, checking the stop flag as we go
+        target = now + dt.timedelta(seconds=_seconds_to_next_bar(now))
+        while now_ist() < target:
+            if stop_event.is_set():
+                note("stopped from the dashboard")
+                status["state"] = "stopped"
+                return
+            time.sleep(1)
+
+        try:
+            now = now_ist()
+            frm = dt.datetime.combine(day - dt.timedelta(days=WARMUP_CALENDAR_DAYS),
+                                      MARKET_OPEN)
+            nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, now)
+            if nifty.empty:
+                note("no candles returned — retrying next cycle")
+                continue
+            vix = candles(smart, INDIA_VIX_TOKEN, NSE, frm, now)
+            fut = candles(smart, NIFTY_FUT_TOKEN, NFO, frm, now)
+            if vix.empty:
+                note("VIX empty this cycle — entry filter cannot pass")
+            if fut.empty:
+                note("futures empty this cycle — using spot for strike selection")
+
+            mask = nifty.ts.dt.date == day
+            pos = np.flatnonzero(mask.to_numpy())
+            if len(pos) < 2:
+                note("waiting for the session to produce bars")
+                continue
+
+            # drop the final row: it is the still-forming candle
+            pos = pos[:-1]
+            new = [p for p in pos if last_ts is None or nifty.ts.iloc[p] > last_ts]
+            if not new:
+                note("no new completed bar yet")
+                continue
+
+            for p in new:
+                i = int(p)
+                bar_ts = nifty.ts.iloc[i]
+                spot = float(nifty.close.iloc[i])
+                fr = fut[fut.ts <= bar_ts] if ("ts" in fut.columns and not fut.empty) \
+                    else empty_candles()
+                fv = float(fr.close.iloc[-1]) if not fr.empty else spot
+                for e in engines:
+                    e._vix = vix
+                    e.on_bar(day, nifty, i, None, bar_ts, spot, fv)
+                last_ts = bar_ts
+
+            note(f"processed to {last_ts:%H:%M}")
+
+            # flush closed legs, then mirror open state
+            wrote = 0
+            for e in engines:
+                rows = e.new_closed_rows(day)
+                if rows:
+                    wrote += append_rows("LIVE", TAB_TRADES, TRADE_HEADERS, rows)
+            open_rows = [r for e in engines for r in e.open_rows(day)]
+            _replace_open_positions(open_rows, day)
+            if wrote:
+                note(f"{wrote} closed leg(s) written")
+
+            snap = []
+            for e in engines:
+                snap.append([now.strftime("%Y-%m-%d %H:%M:%S"), str(day), e.name,
+                             round(e.state.pnl(), 2), len(e.state.closed_legs),
+                             len(e.state.open_legs), e.state.straddle_count,
+                             "; ".join(f"{l.symbol}@{l.entry_price:.1f}"
+                                       for l in e.state.open_legs)])
+            append_rows("LIVE", TAB_SNAPSHOT, SNAP_HEADERS, snap)
+
+            status["summary"] = {e.name: dict(pnl=round(e.state.pnl(), 2),
+                                              closed=len(e.state.closed_legs),
+                                              open=len(e.state.open_legs),
+                                              straddles=e.state.straddle_count)
+                                 for e in engines}
+            status["last_bar"] = f"{last_ts:%H:%M}"
+        except Exception as e:
+            note(f"cycle error: {type(e).__name__}: {e}")
+            time.sleep(5)
+
+    # ---- end of session: write the daily summary once ----
+    try:
+        rows = []
+        for e in engines:
+            rows.append(["LIVE", e.name, str(day), round(e.state.pnl(), 2),
+                         len(e.state.closed_legs), e.state.straddle_count,
+                         sum(1 for l in e.state.closed_legs if l.naked),
+                         sum(1 for l in e.state.closed_legs
+                             if l.exit_reason == "REVERSAL_EMA_CROSS"),
+                         e.state.redeploys])
+            hb = e.heartbeat
+            if hb:
+                append_rows("LIVE", TAB_HEARTBEAT, HEARTBEAT_HEADERS, hb)
+        append_rows("LIVE", TAB_SUMMARY, SUMMARY_HEADERS, rows)
+        _replace_open_positions([], day)
+        note("daily summary written")
+        status["state"] = "finished"
+    except Exception as e:
+        note(f"final write failed: {type(e).__name__}: {e}")
+        status["state"] = "finished_with_errors"
+
+
 # ============================== THEME + HELPERS =============================
 CSS = """
 <style>
@@ -979,73 +1216,79 @@ def render_run(T, S, H, O, variants, kind, write):
 if page == "Live run":
     st.markdown(header("Live run", "FIXED_1_3X · DYNAMIC_SL — paper, no orders placed",
                        SESSION_LIVE), unsafe_allow_html=True)
+
+    if "engine_thread" not in st.session_state:
+        st.session_state.engine_thread = None
+        st.session_state.stop_event = threading.Event()
+        st.session_state.engine_status = {}
+
+    running = (st.session_state.engine_thread is not None
+               and st.session_state.engine_thread.is_alive())
+    status = st.session_state.engine_status
+
     try:
         exps = expiries_for(TODAY)
     except Exception as e:
         st.error(f"Could not load expiries: {e}"); st.stop()
 
-    c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.1, 1])
+    c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.1, 1])
     with c1:
         st.markdown(stat("Trading day", TODAY.strftime("%d %b %Y")), unsafe_allow_html=True)
     with c2:
-        st.markdown(stat("Weekday", TODAY.strftime("%A")), unsafe_allow_html=True)
+        st.markdown(stat("Last bar", status.get("last_bar", "--")), unsafe_allow_html=True)
     with c3:
         exp_live = st.selectbox("Expiry", exps,
                                 format_func=lambda d: f"{d:%d %b} · {(d-TODAY).days}d",
-                                key="exp_live", label_visibility="collapsed")
+                                key="exp_live", label_visibility="collapsed",
+                                disabled=running)
         st.caption("Expiry")
     with c4:
         st.write("")
-        go = st.button("Run session", type="primary")
+        if not running:
+            start = st.button("Start engine", type="primary")
+            if start:
+                st.session_state.stop_event = threading.Event()
+                st.session_state.engine_status = {"state": "starting", "log": []}
+                th = threading.Thread(target=live_engine_loop,
+                                      args=(st.session_state.stop_event, exp_live,
+                                            st.session_state.engine_status),
+                                      daemon=True)
+                th.start()
+                st.session_state.engine_thread = th
+                time.sleep(1)
+                st.rerun()
+        else:
+            if st.button("Stop engine"):
+                st.session_state.stop_event.set()
+                st.session_state.engine_thread.join(timeout=5)
+                st.session_state.engine_thread = None
+                st.rerun()
 
-    if TODAY.weekday() >= 5:
-        st.info("Weekend — no session to run.")
-    elif SESSION_LIVE:
-        st.info(f"Session open · {NOW:%H:%M} IST. Each run processes every completed "
-                "bar from 09:15 to now. The daily record is written after 15:30.")
-    elif not SESSION_OVER:
-        st.info(f"Pre-market · {NOW:%H:%M} IST.")
+    state = status.get("state", "idle")
+    if running:
+        st.success(f"Engine {state} · polls each 3-min bar close and writes to Sheets. "
+                   "It keeps running after you close this tab, until the market closes "
+                   "or the container is recycled.")
+    elif state in ("finished", "finished_with_errors"):
+        st.info(f"Engine {state.replace('_', ' ')}. Daily summary written.")
+    elif state == "failed":
+        st.error("Engine failed to start — see the log below.")
+    elif TODAY.weekday() >= 5:
+        st.info("Weekend — no session.")
+    else:
+        st.info(f"Engine idle · {NOW:%H:%M} IST. Start it any time during the session; "
+                "it processes every completed bar from 09:15 onward.")
 
-    ac1, ac2 = st.columns([1.4, 1])
-    snap = ac1.checkbox("Log each run to Straddle_Snapshots", value=SESSION_LIVE,
-                        help="Appends a timestamped row per strategy so intraday "
-                             "polls leave a trail without touching the daily record.")
-    auto = ac2.checkbox("Auto-refresh", value=False,
-                        help="Re-runs while this tab stays open and awake. "
-                             "Streamlit Cloud sleeps on inactivity, so this is not "
-                             "unattended logging.")
-    if auto and SESSION_LIVE:
-        every = st.select_slider("Refresh every", [3, 5, 10, 15], value=3,
-                                 format_func=lambda m: f"{m} min")
-        st.caption(f"Next refresh in ~{every} min. Keep this tab open.")
-
-    if go or (auto and SESSION_LIVE):
-        p = st.progress(0.0, text="fetching candles")
-        try:
-            out, logs, notes, err = run_dates([TODAY], "LIVE", VARIANTS_LIVE,
-                                              expiry_override=exp_live,
-                                              finalize=SESSION_OVER, progress=p)
-            p.empty()
-            if err:
-                st.error(err)
-            else:
-                T, S, H, O = out
-                for n in notes:
-                    st.warning(n)
-                render_run(T, S, H, O, VARIANTS_LIVE, "LIVE", SESSION_OVER)
-                if snap and not SESSION_OVER:
-                    try:
-                        n = write_snapshot(T, S, O, TODAY, NOW.strftime("%Y-%m-%d %H:%M:%S"))
-                        st.caption(f"{n} snapshot row(s) appended at {NOW:%H:%M} IST.")
-                    except Exception as e:
-                        st.warning(f"Snapshot write failed: {e}")
-                with st.expander("Engine log"):
-                    st.code("\n".join(logs) or "(nothing)")
-        except Exception as e:
-            p.empty(); st.error(f"{type(e).__name__}: {e}")
-        if auto and SESSION_LIVE:
-            time.sleep(int(every) * 60)
-            st.rerun()
+    summ = status.get("summary")
+    if summ:
+        S_live = pd.DataFrame([{"strategy": k, "total_pnl": v["pnl"],
+                                "num_legs": v["closed"], "trading_date": str(TODAY)}
+                               for k, v in summ.items()])
+        render_kpis(S_live, VARIANTS_LIVE, TODAY.strftime("%d %b"))
+        det = pd.DataFrame([{"strategy": k, **v} for k, v in summ.items()])
+        st.markdown(panel("Current state", f"as of {status.get('last_bar','--')}"),
+                    unsafe_allow_html=True)
+        st.dataframe(det, use_container_width=True, hide_index=True)
     else:
         try:
             S = read_tab("LIVE", TAB_SUMMARY)
@@ -1055,16 +1298,24 @@ if page == "Live run":
             render_kpis(pd.DataFrame(columns=["strategy", "total_pnl", "num_legs",
                                               "trading_date"]), VARIANTS_LIVE)
             st.markdown(empty_state("Nothing recorded yet",
-                        "Press Run session after 15:30 to record today.", "◇"),
+                        "Start the engine and it will log each bar close.", "◇"),
                         unsafe_allow_html=True)
         else:
             S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
             render_kpis(S, VARIANTS_LIVE, "to date")
             ch = equity_chart(S)
             if ch is not None:
-                st.markdown(panel("Cumulative P&L", "live paper record"),
-                            unsafe_allow_html=True)
+                st.markdown(panel("Cumulative P&L", "live record"), unsafe_allow_html=True)
                 st.altair_chart(ch, use_container_width=True)
+
+    lg = status.get("log")
+    if lg:
+        st.markdown(panel("Engine log", "newest last"), unsafe_allow_html=True)
+        st.code("\n".join(lg[-25:]))
+    if running:
+        if st.button("Refresh view"):
+            st.rerun()
+        st.caption("The engine runs independently — refreshing only updates this page.")
 
 # ================================ BACKTEST =================================
 elif page == "Backtest":
