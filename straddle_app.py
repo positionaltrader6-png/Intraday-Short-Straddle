@@ -1015,7 +1015,32 @@ CSS = """
    #f7f5fb; }
 html, body, [class*="css"], .stMarkdown, p, div, span, label
    { font-family:'Plus Jakarta Sans',sans-serif; }
-#MainMenu, footer, header { visibility:hidden; }
+#MainMenu, footer { visibility:hidden; }
+header[data-testid="stHeader"] { background:transparent; height:0; }
+
+/* The sidebar is pinned open. Hiding the header also hid Streamlit's expand
+   arrow, so a stray click on collapse left no way back — the collapse control
+   is removed instead and the panel forced visible. */
+[data-testid="stSidebarCollapseButton"],
+[data-testid="collapsedControl"],
+button[kind="header"] { display:none !important; }
+
+section[data-testid="stSidebar"] {
+  visibility:visible !important;
+  transform:none !important;
+  margin-left:0 !important;
+  min-width:290px !important;
+  width:290px !important; }
+section[data-testid="stSidebar"][aria-expanded="false"] {
+  visibility:visible !important; transform:none !important; }
+
+/* On a phone a pinned 290px panel would swallow the screen, so let it behave
+   normally there and restore the expand control. */
+@media (max-width:640px) {
+  section[data-testid="stSidebar"] { min-width:0 !important; width:auto !important; }
+  [data-testid="stSidebarCollapseButton"],
+  [data-testid="collapsedControl"] { display:block !important; }
+}
 .block-container { padding:1rem 2rem 3rem; max-width:1480px; }
 
 /* ---------- sidebar ---------- */
@@ -1536,4 +1561,3 @@ else:
     else:
         st.markdown(empty_state("Ready", "Choose a source and press Load.", "◈"),
                     unsafe_allow_html=True)
-
