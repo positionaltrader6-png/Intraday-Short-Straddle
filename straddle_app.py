@@ -57,19 +57,13 @@ st.set_page_config(page_title="Straddle Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="expanded")
 
 # ============================== CONSTANTS ===================================
-# Streamlit Cloud runs in UTC. Every time decision here — session state, the
-# candle-fetch cap, "today" — must be IST or the app silently asks the broker
-# for the wrong window and finds no data.
 IST = ZoneInfo("Asia/Kolkata")
-
 
 def now_ist():
     return dt.datetime.now(IST).replace(tzinfo=None)
 
-
 def today_ist():
     return dt.datetime.now(IST).date()
-
 
 NIFTY_INDEX_TOKEN = "99926000"
 NIFTY_FUT_TOKEN = "68407"          # front month — update after each roll
@@ -119,7 +113,7 @@ VARIANTS_BACKTEST = [FIXED, DYNAMIC, NAKED]      # backtest
 TAB_TRADES = "Straddle_Trades"
 TAB_SUMMARY = "Straddle_Summary"
 TAB_HEARTBEAT = "Straddle_Heartbeat"
-TAB_SNAPSHOT = "Straddle_Snapshots"
+TAB_LOG = "Straddle_3Min_Log"
 TAB_OPEN = "Straddle_Open_Positions"
 
 OPEN_HEADERS = ["strategy", "trading_date", "straddle_num", "leg_symbol", "opt_type",
@@ -137,8 +131,9 @@ TRADE_HEADERS = ["run_type", "trading_date", "strategy", "straddle_num", "leg_sy
                  "sl_tightened", "carry_bars"]
 SUMMARY_HEADERS = ["run_type", "strategy", "trading_date", "total_pnl", "num_legs",
                    "num_straddles", "naked_legs", "reversal_exits", "redeploys"]
-SNAP_HEADERS = ["snapshot_at", "trading_date", "strategy", "realised_pnl",
-                "closed_legs", "open_legs", "straddles", "detail"]
+LOG_HEADERS = ["timestamp", "trading_date", "strategy", "spot", "trend", 
+               "straddles_count", "open_legs_info", "realised_pnl", 
+               "unrealised_pnl", "total_pnl"]
 HEARTBEAT_HEADERS = ["trading_date", "bar_time", "spot", "adx", "adxr", "chop",
                      "loxx_width", "loxx_width_avg", "width_ok", "momentum",
                      "loxx_up", "loxx_dn", "kc_break_up", "kc_break_dn", "trend"]
@@ -202,20 +197,6 @@ def append_rows(kind, tab, headers, rows):
     return len(rows)
 
 
-def write_snapshot(T, S, O, day, stamp):
-    rows = []
-    for v in VARIANTS_LIVE:
-        nm = v[0]
-        ts_ = T[T.strategy == nm] if not T.empty else T
-        os_ = O[O.strategy == nm] if not O.empty else O
-        pnl = pd.to_numeric(ts_.pnl, errors="coerce").sum() if not ts_.empty else 0
-        det = "; ".join(f"{r.leg_symbol}@{r.entry_price}" for r in os_.itertuples()) \
-              if not os_.empty else ""
-        rows.append([stamp, str(day), nm, round(float(pnl), 2), len(ts_), len(os_),
-                     int(ts_.straddle_num.max()) if not ts_.empty else 0, det])
-    return append_rows("LIVE", TAB_SNAPSHOT, SNAP_HEADERS, rows)
-
-
 def read_tab(kind, tab):
     import gspread
     try:
@@ -244,7 +225,7 @@ def discord(msg, tag=""):
             r = requests.post(url, json=body, timeout=6)
             if r.status_code in (200, 204):
                 return True
-            if r.status_code == 429:          # rate limited
+            if r.status_code == 429:
                 time.sleep(float(r.headers.get("Retry-After", 2)))
                 continue
             return False
@@ -516,7 +497,6 @@ class StraddleEngine:
         if len(self.state.open_legs)+2 > self.max_open_legs:
             return False
 
-        # Determine the two closest strikes wrapping the current underlying
         base_price = fut if day.weekday() == 0 else spot
         remainder = base_price % STRIKE_STEP
         lower_strike = int(base_price - remainder)
@@ -526,7 +506,6 @@ class StraddleEngine:
         best_diff = float('inf')
         best_legs = []
         
-        # Test both strikes to find the smallest CE-PE premium difference
         for test_strike in (lower_strike, upper_strike):
             temp_legs = []
             valid = True
@@ -707,6 +686,28 @@ class StraddleEngine:
         self._logged = set()
         self.last_ts = None
 
+    def get_status(self, day, now, spot):
+        """Helper to compute open PnL and active leg statuses for logging"""
+        unrealised = 0
+        open_info = []
+        for leg in self.state.open_legs:
+            _, df = self.option_df(day, leg.strike, leg.opt_type)
+            r = df[df.ts <= now]
+            ltp = float(r.close.iloc[-1]) if not r.empty else leg.entry_price
+            leg_pnl = (leg.entry_price - ltp) * leg.qty
+            unrealised += leg_pnl
+            open_info.append(f"{leg.opt_type}{leg.strike}: E:{leg.entry_price:.1f} LTP:{ltp:.1f}")
+        
+        realised = self.state.pnl()
+        return {
+            "spot": spot,
+            "trend": self._prev_trend or "NONE",
+            "open_info": " | ".join(open_info) if open_info else "No Open Legs",
+            "realised_pnl": realised,
+            "unrealised_pnl": unrealised,
+            "total_pnl": realised + unrealised
+        }
+
     def new_closed_rows(self, day, run_type="LIVE"):
         rows = []
         for leg in self.state.closed_legs:
@@ -855,14 +856,12 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
         engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
                    for nm, dyn, rd, ml in VARIANTS_LIVE]
                    
-        # 1. Fetch existing open positions from the sheet
         open_df = pd.DataFrame()
         try:
             open_df = read_tab("LIVE", TAB_OPEN)
         except Exception as e:
             note(f"No previous state found or sheet missing: {e}")
             
-        # 2. Filter out stale data; only resume legs opened today
         if not open_df.empty and "trading_date" in open_df.columns:
             open_df = open_df[open_df["trading_date"] == str(day)]
 
@@ -870,7 +869,6 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             e.prepare(day)
             e.notify = notify_on
             
-            # 3. Reconstruct Leg objects and inject them into the engine state
             if not open_df.empty:
                 e_open = open_df[open_df["strategy"] == e.name]
                 for _, row in e_open.iterrows():
@@ -896,7 +894,6 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
                     )
                     e.state.open_legs.append(leg)
                 
-                # Fast-forward the engine's straddle count tracker
                 if e.state.open_legs:
                     e.state.straddle_count = max([l.straddle_num for l in e.state.open_legs])
                     
@@ -966,6 +963,10 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
                 note("no new completed bar yet")
                 continue
 
+            # CRITICAL FIX: Clear the option cache in the live loop so the engine 
+            # fetches fresh LTPs for the exact current minute rather than stale morning data.
+            cache.clear()
+
             for p in new:
                 i = int(p)
                 bar_ts = nifty.ts.iloc[i]
@@ -990,14 +991,23 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             if wrote:
                 note(f"{wrote} closed leg(s) written")
 
-            snap = []
+            # Execute 3-Minute Status Logging
+            log_rows = []
             for e in engines:
-                snap.append([now.strftime("%Y-%m-%d %H:%M:%S"), str(day), e.name,
-                             round(e.state.pnl(), 2), len(e.state.closed_legs),
-                             len(e.state.open_legs), e.state.straddle_count,
-                             "; ".join(f"{l.symbol}@{l.entry_price:.1f}"
-                                       for l in e.state.open_legs)])
-            append_rows("LIVE", TAB_SNAPSHOT, SNAP_HEADERS, snap)
+                st_data = e.get_status(day, last_ts, spot)
+                log_rows.append([
+                    last_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    str(day),
+                    e.name,
+                    round(st_data["spot"], 2),
+                    st_data["trend"],
+                    e.state.straddle_count,
+                    st_data["open_info"],
+                    round(st_data["realised_pnl"], 2),
+                    round(st_data["unrealised_pnl"], 2),
+                    round(st_data["total_pnl"], 2)
+                ])
+            append_rows("LIVE", TAB_LOG, LOG_HEADERS, log_rows)
 
             status["summary"] = {e.name: dict(pnl=round(e.state.pnl(), 2),
                                               closed=len(e.state.closed_legs),
