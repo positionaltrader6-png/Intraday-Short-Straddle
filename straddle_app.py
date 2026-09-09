@@ -123,8 +123,8 @@ TAB_SNAPSHOT = "Straddle_Snapshots"
 TAB_OPEN = "Straddle_Open_Positions"
 
 OPEN_HEADERS = ["strategy", "trading_date", "straddle_num", "leg_symbol", "opt_type",
-                "strike", "entry_time", "entry_price", "sl", "naked", "naked_since",
-                "sl_tightened"]
+                "strike", "entry_time", "entry_price", "sl", "qty", "entry_idx", 
+                "naked", "naked_since", "sl_tightened"]
 
 MARKET_OPEN = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
@@ -164,8 +164,6 @@ SHEET_KEYS = {"LIVE": "live_sheet_id", "BACKTEST": "backtest_sheet_id"}
 
 @st.cache_resource(show_spinner=False)
 def sheet(kind):
-    """Live and backtest results go to separate spreadsheets so a backtest
-    sweep can never be mistaken for accumulated live paper history."""
     import gspread
     from google.oauth2.service_account import Credentials
     creds = Credentials.from_service_account_info(
@@ -205,8 +203,6 @@ def append_rows(kind, tab, headers, rows):
 
 
 def write_snapshot(T, S, O, day, stamp):
-    """A row per strategy per snapshot, so an intraday poll leaves a trail
-    without touching the end-of-day record in Straddle_Summary."""
     rows = []
     for v in VARIANTS_LIVE:
         nm = v[0]
@@ -231,7 +227,6 @@ def read_tab(kind, tab):
 
 
 # ============================== MARKET DATA =================================
-# ============================== DISCORD =====================================
 def discord_url():
     try:
         return st.secrets["discord"]["webhook"]
@@ -240,8 +235,6 @@ def discord_url():
 
 
 def discord(msg, tag=""):
-    """Fire-and-forget notification. A webhook failure must never interrupt
-    the engine, so every error is swallowed after one retry."""
     url = discord_url()
     if not url:
         return False
@@ -264,9 +257,6 @@ CANDLE_COLS = ["ts", "open", "high", "low", "close", "volume"]
 
 
 def empty_candles():
-    """An empty frame WITH the expected columns. A bare pd.DataFrame() has no
-    columns, so downstream `.ts` access raises AttributeError instead of just
-    being empty — which is how a failed VIX or futures fetch used to crash a run."""
     return pd.DataFrame(columns=CANDLE_COLS)
 
 
@@ -314,7 +304,6 @@ def nearest_expiry(expiries, day):
 
 
 def expiry_choices(expiries, day, n=6):
-    """Expiries on or after `day`, nearest first."""
     return [e for e in expiries if e >= day][:n]
 
 
@@ -370,9 +359,6 @@ def compute_lwma(s, p):
 
 
 def compute_loxx_hlhvb(df, period=LOXX_PERIOD, dev=LOXX_DEV):
-    """Loxx HLHVB. The MIDLINE supplies direction via its slope; band width is
-    a separate squeeze filter. Using width alone as the trend test was why
-    trend detection almost never fired."""
     me = compute_lwma(2*compute_lwma(df.close, int(period/2)) - compute_lwma(df.close, period),
                       int(period ** 0.5))
     d = (df.high-df.low).rolling(period).std(ddof=1)
@@ -444,11 +430,10 @@ class StraddleEngine:
         self._prev_trend = None
         self._diag = None
         self.log = []
-        self.notify = False          # only the live engine turns this on
+        self.notify = False
         self._logged = set()
         self.last_ts = None
 
-    # ---- data ----
     def option_df(self, day, strike, ot):
         key = (day, strike, ot)
         if key in self.cache:
@@ -464,7 +449,6 @@ class StraddleEngine:
         self.cache[key] = (sym, df)
         return self.cache[key]
 
-    # ---- signals ----
     def entry_ok(self, nifty, vix, i, now):
         if not (ENTRY_START <= now.time() <= ENTRY_END):
             return False
@@ -494,8 +478,6 @@ class StraddleEngine:
         wavg = width.rolling(LOXX_PERIOD).mean()
         close = float(sub.close.iloc[-1]); hi = float(sub.high.iloc[-1]); lo = float(sub.low.iloc[-1])
 
-        # NaN width_avg means the squeeze filter has not warmed up; skip it
-        # rather than vetoing the whole check.
         wa = wavg.iloc[-1]
         width_ok = bool(width.iloc[-1] <= wa*LOXX_WIDTH_MULT) if pd.notna(wa) else True
 
@@ -528,37 +510,66 @@ class StraddleEngine:
             return fresh
         return True
 
-    # ---- positions ----
     def deploy(self, day, spot, fut, now, idx, tag="ENTRY"):
         if self.state.straddle_count >= MAX_STRADDLES_PER_DAY:
             return False
         if len(self.state.open_legs)+2 > self.max_open_legs:
             return False
-        strike = int(round((fut if day.weekday() == 0 else spot)/STRIKE_STEP)*STRIKE_STEP)
-        legs = []
-        for ot in ("CE", "PE"):
-            sym, df = self.option_df(day, strike, ot)
-            if df.empty:
-                self.log.append(f"{self.name}: no data for {sym}")
-                return False
-            row = df[df.ts <= now]
-            if row.empty:
-                return False
-            legs.append((sym, ot, float(row.close.iloc[-1])))
+
+        # Determine the two closest strikes wrapping the current underlying
+        base_price = fut if day.weekday() == 0 else spot
+        remainder = base_price % STRIKE_STEP
+        lower_strike = int(base_price - remainder)
+        upper_strike = int(lower_strike + STRIKE_STEP)
+        
+        best_strike = None
+        best_diff = float('inf')
+        best_legs = []
+        
+        # Test both strikes to find the smallest CE-PE premium difference
+        for test_strike in (lower_strike, upper_strike):
+            temp_legs = []
+            valid = True
+            for ot in ("CE", "PE"):
+                sym, df = self.option_df(day, test_strike, ot)
+                if df.empty:
+                    valid = False
+                    break
+                row = df[df.ts <= now]
+                if row.empty:
+                    valid = False
+                    break
+                temp_legs.append((sym, ot, float(row.close.iloc[-1])))
+            
+            if valid and len(temp_legs) == 2:
+                diff = abs(temp_legs[0][2] - temp_legs[1][2])
+                if diff < best_diff:
+                    best_diff = diff
+                    best_strike = test_strike
+                    best_legs = temp_legs
+                    
+        if not best_strike:
+            self.log.append(f"{self.name}: {tag} failed - no valid option data for nearby strikes.")
+            return False
+
+        strike = best_strike
+        legs = best_legs
+
         self.state.straddle_count += 1
         n = self.state.straddle_count
         for sym, ot, px in legs:
             self.state.open_legs.append(Leg(sym, ot, strike, px, px*SL_MULTIPLIER,
                                             LOT_SIZE, now, idx, straddle_num=n))
         self.log.append(f"{self.name}: {tag} straddle #{n} @ {now:%H:%M} strike {strike} "
-                        f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f}")
+                        f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f} (Diff: {best_diff:.2f})")
         if self.notify:
             ce, pe = legs[0], legs[1]
             discord(
                 f"**{self.name}** — {tag} straddle #{n}\n"
                 f"`{now:%H:%M}`  strike **{strike}**  (spot {spot:.1f})\n"
                 f"SELL `{ce[0]}` @ **{ce[2]:.2f}**  ·  SL {ce[2]*SL_MULTIPLIER:.2f}\n"
-                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*SL_MULTIPLIER:.2f}",
+                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*SL_MULTIPLIER:.2f}\n"
+                f"Premium Delta: {best_diff:.2f}",
                 tag="🟢")
         return True
 
@@ -624,10 +635,7 @@ class StraddleEngine:
         if self.deploy(day, spot, fut, now, idx, tag="REDEPLOY"):
             self.state.redeploys += 1
 
-    # ---- one bar ----
     def on_bar(self, day, nifty, i, local_i, now, spot, fut):
-        """local_i is unused; kept so run_day and the threaded engine
-        can call this identically."""
         if now.time() >= HARD_EXIT and not self.state.done:
             for leg in list(self.state.open_legs):
                 _, df = self.option_df(day, leg.strike, leg.opt_type)
@@ -692,8 +700,6 @@ class StraddleEngine:
                 self.deploy(day, spot, fut, now, i)
 
     def prepare(self, day):
-        """Reset for a fresh session. Used by the threaded live engine, which
-        then feeds bars in one at a time rather than replaying the day."""
         self.state = DayState()
         self.heartbeat = []
         self.log = []
@@ -702,8 +708,6 @@ class StraddleEngine:
         self.last_ts = None
 
     def new_closed_rows(self, day, run_type="LIVE"):
-        """Legs closed since the last call, ready for the sheet. Keyed so a
-        repeated call cannot write the same leg twice."""
         rows = []
         for leg in self.state.closed_legs:
             k = f"{leg.symbol}|{leg.entry_time}|{leg.exit_time}"
@@ -723,7 +727,8 @@ class StraddleEngine:
     def open_rows(self, day):
         return [[self.name, str(day), l.straddle_num, l.symbol, l.opt_type, l.strike,
                  l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
-                 round(l.sl, 2), l.naked, l.naked_since if l.naked_since is not None else "",
+                 round(l.sl, 2), l.qty, l.entry_idx if l.entry_idx is not None else "",
+                 l.naked, l.naked_since if l.naked_since is not None else "",
                  l.sl_tightened] for l in self.state.open_legs]
 
     def run_day(self, day, nifty, vix, fut, finalize=True):
@@ -741,9 +746,6 @@ class StraddleEngine:
                 else empty_candles()
             self.on_bar(day, nifty, i, li, now,
                         spot, float(fr.close.iloc[-1]) if not fr.empty else spot)
-        # Only force-close when the session is actually over. On a mid-session
-        # run these legs are still live — booking them at entry price would
-        # invent zero-P&L exits that never happened.
         if finalize:
             for leg in list(self.state.open_legs):
                 self.exit_leg(leg, leg.entry_price, "FORCED_DAY_END",
@@ -757,9 +759,6 @@ def run_dates(dates, run_type, variants, expiry_override=None,
     lookup, expiries = option_universe()
     first, last = min(dates), max(dates)
     frm = dt.datetime.combine(first-dt.timedelta(days=WARMUP_CALENDAR_DAYS), dt.time(9, 15))
-    # Cap at IST "now" so a mid-session run asks only for candles that exist.
-    # Using a UTC clock here would request a window 5h30m in the past and
-    # come back nearly empty.
     to = min(dt.datetime.combine(last, dt.time(15, 30)), now_ist())
 
     nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, to)
@@ -823,8 +822,6 @@ def run_dates(dates, run_type, variants, expiry_override=None,
 # ============================== UI ===========================================
 # ============================== THREADED LIVE ENGINE ========================
 def _seconds_to_next_bar(now):
-    """Sleep target: the next 3-minute boundary plus a buffer, so the bar has
-    actually closed broker-side before we ask for it."""
     secs = (CANDLE_MIN - (now.minute % CANDLE_MIN)) * 60 - now.second
     if secs <= 0:
         secs = CANDLE_MIN * 60
@@ -832,9 +829,6 @@ def _seconds_to_next_bar(now):
 
 
 def _replace_open_positions(sh_rows, day):
-    """The open-positions tab mirrors current state, so it is rewritten whole
-    rather than appended to. On a container restart it is what tells the engine
-    what was live."""
     import gspread
     sh = sheet("LIVE")
     try:
@@ -847,14 +841,6 @@ def _replace_open_positions(sh_rows, day):
 
 
 def live_engine_loop(stop_event, expiry, status, notify_on=False):
-    """Runs in a daemon thread, so it survives the browser closing and keeps
-    ticking until the container is recycled or the market closes.
-
-    Each cycle fetches candles up to now, feeds only bars not yet seen into
-    each engine, then flushes newly closed legs and a snapshot to Sheets.
-    Engines hold their state in this thread's locals — nothing depends on
-    Streamlit session state, which is per-browser-session and would be lost.
-    """
     day = today_ist()
     status["state"] = "starting"
     status["log"] = []
@@ -868,12 +854,61 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
         cache = {}
         engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
                    for nm, dyn, rd, ml in VARIANTS_LIVE]
+                   
+        # 1. Fetch existing open positions from the sheet
+        open_df = pd.DataFrame()
+        try:
+            open_df = read_tab("LIVE", TAB_OPEN)
+        except Exception as e:
+            note(f"No previous state found or sheet missing: {e}")
+            
+        # 2. Filter out stale data; only resume legs opened today
+        if not open_df.empty and "trading_date" in open_df.columns:
+            open_df = open_df[open_df["trading_date"] == str(day)]
+
         for e in engines:
             e.prepare(day)
             e.notify = notify_on
-        note(f"engine up · expiry {expiry} · {len(engines)} variants")
+            
+            # 3. Reconstruct Leg objects and inject them into the engine state
+            if not open_df.empty:
+                e_open = open_df[open_df["strategy"] == e.name]
+                for _, row in e_open.iterrows():
+                    try:
+                        time_obj = dt.datetime.strptime(str(row["entry_time"]), "%H:%M:%S").time()
+                        entry_time = dt.datetime.combine(day, time_obj)
+                    except Exception:
+                        entry_time = now_ist()
+                        
+                    leg = Leg(
+                        symbol=str(row["leg_symbol"]),
+                        opt_type=str(row["opt_type"]),
+                        strike=int(row["strike"]),
+                        entry_price=float(row["entry_price"]),
+                        sl=float(row["sl"]),
+                        qty=int(row["qty"]) if "qty" in row and pd.notna(row["qty"]) else LOT_SIZE,
+                        entry_time=entry_time,
+                        entry_idx=int(row["entry_idx"]) if "entry_idx" in row and pd.notna(row["entry_idx"]) and str(row["entry_idx"]).isdigit() else 0,
+                        straddle_num=int(row["straddle_num"]),
+                        naked=bool(row["naked"]),
+                        naked_since=int(row["naked_since"]) if pd.notna(row["naked_since"]) and str(row["naked_since"]).isdigit() else None,
+                        sl_tightened=bool(row["sl_tightened"])
+                    )
+                    e.state.open_legs.append(leg)
+                
+                # Fast-forward the engine's straddle count tracker
+                if e.state.open_legs:
+                    e.state.straddle_count = max([l.straddle_num for l in e.state.open_legs])
+                    
+        resume_count = sum(len(e.state.open_legs) for e in engines)
+        msg = f"engine up · expiry {expiry} · {len(engines)} variants"
+        if resume_count > 0:
+            msg += f" · resumed {resume_count} live legs"
+        note(msg)
+
         if notify_on:
             discord(f"**Straddle Desk started**\n`{day}`  expiry `{expiry}`\n"
+                    f"Resumed open legs: {resume_count}\n"
                     f"variants: {', '.join(e.name for e in engines)}", tag="🚀")
     except Exception as e:
         status["state"] = "failed"
@@ -894,7 +929,6 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             note("market closed — finalising")
             break
 
-        # wait for the next completed bar, checking the stop flag as we go
         target = now + dt.timedelta(seconds=_seconds_to_next_bar(now))
         while now_ist() < target:
             if stop_event.is_set():
@@ -926,7 +960,6 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
                 note("waiting for the session to produce bars")
                 continue
 
-            # drop the final row: it is the still-forming candle
             pos = pos[:-1]
             new = [p for p in pos if last_ts is None or nifty.ts.iloc[p] > last_ts]
             if not new:
@@ -947,7 +980,6 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
 
             note(f"processed to {last_ts:%H:%M}")
 
-            # flush closed legs, then mirror open state
             wrote = 0
             for e in engines:
                 rows = e.new_closed_rows(day)
@@ -977,7 +1009,6 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             note(f"cycle error: {type(e).__name__}: {e}")
             time.sleep(5)
 
-    # ---- end of session: write the daily summary once ----
     try:
         rows = []
         for e in engines:
@@ -1018,9 +1049,6 @@ html, body, [class*="css"], .stMarkdown, p, div, span, label
 #MainMenu, footer { visibility:hidden; }
 header[data-testid="stHeader"] { background:transparent; height:0; }
 
-/* The sidebar is pinned open. Hiding the header also hid Streamlit's expand
-   arrow, so a stray click on collapse left no way back — the collapse control
-   is removed instead and the panel forced visible. */
 [data-testid="stSidebarCollapseButton"],
 [data-testid="collapsedControl"],
 button[kind="header"] { display:none !important; }
@@ -1034,8 +1062,6 @@ section[data-testid="stSidebar"] {
 section[data-testid="stSidebar"][aria-expanded="false"] {
   visibility:visible !important; transform:none !important; }
 
-/* On a phone a pinned 290px panel would swallow the screen, so let it behave
-   normally there and restore the expand control. */
 @media (max-width:640px) {
   section[data-testid="stSidebar"] { min-width:0 !important; width:auto !important; }
   [data-testid="stSidebarCollapseButton"],
@@ -1057,7 +1083,6 @@ section[data-testid="stSidebar"] .block-container { padding-top:1.6rem; }
 .brand-sub { font-size:.72rem; color:#b9a8d4; margin-bottom:1.5rem;
   letter-spacing:.04em; text-transform:uppercase; font-weight:600; }
 
-/* nav: turn the radio group into nav rows */
 section[data-testid="stSidebar"] div[role="radiogroup"] { gap:.3rem; }
 section[data-testid="stSidebar"] div[role="radiogroup"] > label {
   background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.06);
@@ -1172,8 +1197,6 @@ def empty_state(title, sub, ico="◇"):
 
 
 def header(title, tag="", live=False):
-    """tag is accepted and ignored — the header subtitle was removed on
-    request. Kept in the signature so existing call sites still work."""
     dot = "dot-live" if live else "dot-off"
     when = f"{now_ist():%H:%M}"
     txt = f"Session open · {when}" if live else f"Session closed · {when}"
@@ -1195,7 +1218,6 @@ def expiries_for(day):
 
 
 def equity_chart(S):
-    """Cumulative P&L per variant."""
     if S.empty:
         return None
     d = S.copy()
@@ -1217,7 +1239,6 @@ def equity_chart(S):
 
 
 def reason_chart(T):
-    """Exit reasons by count."""
     if T.empty or "exit_reason" not in T.columns:
         return None
     g = T.groupby("exit_reason").size().reset_index(name="n")
