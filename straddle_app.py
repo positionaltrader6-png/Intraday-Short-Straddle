@@ -232,22 +232,6 @@ def append_rows(kind, tab, headers, rows):
     return len(rows)
 
 
-def write_snapshot(T, S, O, day, stamp):
-    """A row per strategy per snapshot, so an intraday poll leaves a trail
-    without touching the end-of-day record in Straddle_Summary."""
-    rows = []
-    for v in VARIANTS_LIVE:
-        nm = v[0]
-        ts_ = T[T.strategy == nm] if not T.empty else T
-        os_ = O[O.strategy == nm] if not O.empty else O
-        pnl = pd.to_numeric(ts_.pnl, errors="coerce").sum() if not ts_.empty else 0
-        det = "; ".join(f"{r.leg_symbol}@{r.entry_price}" for r in os_.itertuples()) \
-              if not os_.empty else ""
-        rows.append([stamp, str(day), nm, round(float(pnl), 2), len(ts_), len(os_),
-                     int(ts_.straddle_num.max()) if not ts_.empty else 0, det])
-    return append_rows("LIVE", TAB_SNAPSHOT, SNAP_HEADERS, rows)
-
-
 def replace_tab(kind, tab, headers, rows):
     """Rewrite a tab whole. Used for the status sheet, which mirrors current
     state rather than accumulating history."""
@@ -1468,7 +1452,12 @@ with st.sidebar:
         if st.button("Send test"):
             ok = discord(f"Test from Straddle Desk · {now_ist():%d %b %H:%M} IST",
                          tag="🔔")
-            st.success("Sent — check the channel.") if ok else \
+            # A bare conditional expression here would be picked up by
+            # Streamlit's magic display, which parses the source line to name
+            # the value and fails on the continuation. Plain if/else instead.
+            if ok:
+                st.success("Sent — check the channel.")
+            else:
                 st.error("Failed. Check the webhook URL in secrets.")
     else:
         notify_on = False
