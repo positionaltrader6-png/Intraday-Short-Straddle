@@ -7,9 +7,15 @@ Three variants, one shared data feed, results persisted to Google Sheets.
                replacement straddle deploys immediately.
   DYNAMIC_SL   same, but when a trend confirms, the hurt leg tightens to
                1.25x. Only straddle #1 is eligible (TIGHTEN_MODE).
-  NAKED_CARRY  no immediate replacement. The naked leg is carried until it
-               closes by its own SL or a 21-EMA reversal; the replacement
-               deploys then.
+In both variants, when one leg stops out its partner is carried on as a
+naked leg until its own SL or a 21-EMA reversal closes it.
+
+SHEETS
+------
+  Live_Status      constant. The current day's full leg ledger, rewritten
+                   every cycle. Also what the engine reads to resume.
+  Log_<date>       one row per strategy every 3 minutes, open to close.
+  Trades_<date>    one row per leg, appended when the leg closes.
 
 WHY THERE IS NO LIVE POLLING LOOP
 ---------------------------------
@@ -57,13 +63,19 @@ st.set_page_config(page_title="Straddle Desk", page_icon="◆", layout="wide",
                    initial_sidebar_state="expanded")
 
 # ============================== CONSTANTS ===================================
+# Streamlit Cloud runs in UTC. Every time decision here — session state, the
+# candle-fetch cap, "today" — must be IST or the app silently asks the broker
+# for the wrong window and finds no data.
 IST = ZoneInfo("Asia/Kolkata")
+
 
 def now_ist():
     return dt.datetime.now(IST).replace(tzinfo=None)
 
+
 def today_ist():
     return dt.datetime.now(IST).date()
+
 
 NIFTY_INDEX_TOKEN = "99926000"
 NIFTY_FUT_TOKEN = "68407"          # front month — update after each roll
@@ -100,43 +112,64 @@ HARD_EXIT = dt.time(15, 10)
 MAX_STRADDLES_PER_DAY = 2
 TIGHTEN_MODE = "FIRST_STRADDLE_ONLY"   # FIRST_STRADDLE_ONLY | FRESH_TREND | ALWAYS
 REDEPLOY_IMMEDIATE = "IMMEDIATE"
-REDEPLOY_AFTER_NAKED = "AFTER_NAKED_EXIT"
 
-# name,          dynamic_sl, redeploy_mode,        max_open_legs
-FIXED   = ("FIXED_1_3X",  False, REDEPLOY_IMMEDIATE,   3)
-DYNAMIC = ("DYNAMIC_SL",  True,  REDEPLOY_IMMEDIATE,   3)
-NAKED   = ("NAKED_CARRY", False, REDEPLOY_AFTER_NAKED, 2)
+# A replacement straddle after an SL hit will not deploy past this time.
+REDEPLOY_CUTOFF = dt.time(14, 45)
 
-VARIANTS_LIVE = [FIXED, DYNAMIC]                 # live run
-VARIANTS_BACKTEST = [FIXED, DYNAMIC, NAKED]      # backtest
+# Strikes either side of the rounded ATM to test. The winner is the strike
+# whose CE and PE premiums are closest — the market's true ATM, which the
+# forward basis can push one strike away from a simple spot rounding.
+STRIKE_SCAN = 1
 
-TAB_TRADES = "Straddle_Trades"
-TAB_SUMMARY = "Straddle_Summary"
-TAB_HEARTBEAT = "Straddle_Heartbeat"
-TAB_LOG = "Straddle_3Min_Log"
-TAB_OPEN = "Straddle_Open_Positions"
+# name,          dynamic_sl, redeploy_mode,      max_open_legs
+FIXED   = ("FIXED_1_3X", False, REDEPLOY_IMMEDIATE, 3)
+DYNAMIC = ("DYNAMIC_SL", True,  REDEPLOY_IMMEDIATE, 3)
 
-OPEN_HEADERS = ["strategy", "trading_date", "straddle_num", "leg_symbol", "opt_type",
-                "strike", "entry_time", "entry_price", "sl", "qty", "entry_idx", 
-                "naked", "naked_since", "sl_tightened"]
+VARIANTS_LIVE = [FIXED, DYNAMIC]
+VARIANTS_BACKTEST = [FIXED, DYNAMIC]
+
+# ---- SHEET LAYOUT -------------------------------------------------------
+# Sheet 1  constant name. The full leg ledger for the current day, rewritten
+#          every cycle: open legs with live LTP, closed legs with realised
+#          P&L. This is also what the engine reads to resume after a restart.
+# Sheet 2  Log_<date>. One row per strategy every 3 minutes, open to close.
+# Sheet 3  Trades_<date>. One row per leg, appended when the leg closes.
+TAB_STATUS = "Live_Status"
+
+
+def tab_log(day):
+    return f"Log_{day}"
+
+
+def tab_trades(day):
+    return f"Trades_{day}"
+
+
+STATUS_HEADERS = ["updated_at", "trading_date", "strategy", "status", "straddle_num",
+                  "leg_symbol", "opt_type", "strike", "qty", "entry_time",
+                  "entry_price", "sl", "ltp", "exit_time", "exit_price",
+                  "exit_reason", "leg_pnl", "naked", "sl_tightened", "carry_bars"]
+
+LOG_HEADERS = ["timestamp", "trading_date", "strategy", "spot", "trend",
+               "straddles", "open_legs", "closed_legs", "realised_pnl",
+               "unrealised_pnl", "total_pnl", "legs_detail"]
+
+TRADE_HEADERS = ["trading_date", "strategy", "straddle_num", "leg_symbol", "opt_type",
+                 "strike", "qty", "entry_time", "entry_price", "sl", "exit_time",
+                 "exit_price", "exit_reason", "pnl", "naked", "sl_tightened",
+                 "carry_bars"]
+
+SUMMARY_HEADERS = ["run_type", "strategy", "trading_date", "total_pnl", "num_legs",
+                   "num_straddles", "naked_legs", "reversal_exits", "redeploys"]
+
+HEARTBEAT_HEADERS = ["trading_date", "bar_time", "spot", "adx", "adxr", "chop",
+                     "loxx_width", "loxx_width_avg", "width_ok", "momentum",
+                     "loxx_up", "loxx_dn", "kc_break_up", "kc_break_dn", "trend"]
 
 MARKET_OPEN = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
 CANDLE_MIN = 3
 POLL_BUFFER_SEC = 15
-
-TRADE_HEADERS = ["run_type", "trading_date", "strategy", "straddle_num", "leg_symbol",
-                 "opt_type", "strike", "entry_time", "exit_time", "entry_price",
-                 "exit_price", "sl", "qty", "exit_reason", "pnl", "naked",
-                 "sl_tightened", "carry_bars"]
-SUMMARY_HEADERS = ["run_type", "strategy", "trading_date", "total_pnl", "num_legs",
-                   "num_straddles", "naked_legs", "reversal_exits", "redeploys"]
-LOG_HEADERS = ["timestamp", "trading_date", "strategy", "spot", "trend", 
-               "straddles_count", "open_legs_info", "realised_pnl", 
-               "unrealised_pnl", "total_pnl"]
-HEARTBEAT_HEADERS = ["trading_date", "bar_time", "spot", "adx", "adxr", "chop",
-                     "loxx_width", "loxx_width_avg", "width_ok", "momentum",
-                     "loxx_up", "loxx_dn", "kc_break_up", "kc_break_dn", "trend"]
 
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 MASTER_FALLBACK = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -159,6 +192,8 @@ SHEET_KEYS = {"LIVE": "live_sheet_id", "BACKTEST": "backtest_sheet_id"}
 
 @st.cache_resource(show_spinner=False)
 def sheet(kind):
+    """Live and backtest results go to separate spreadsheets so a backtest
+    sweep can never be mistaken for accumulated live paper history."""
     import gspread
     from google.oauth2.service_account import Credentials
     creds = Credentials.from_service_account_info(
@@ -197,6 +232,56 @@ def append_rows(kind, tab, headers, rows):
     return len(rows)
 
 
+def write_snapshot(T, S, O, day, stamp):
+    """A row per strategy per snapshot, so an intraday poll leaves a trail
+    without touching the end-of-day record in Straddle_Summary."""
+    rows = []
+    for v in VARIANTS_LIVE:
+        nm = v[0]
+        ts_ = T[T.strategy == nm] if not T.empty else T
+        os_ = O[O.strategy == nm] if not O.empty else O
+        pnl = pd.to_numeric(ts_.pnl, errors="coerce").sum() if not ts_.empty else 0
+        det = "; ".join(f"{r.leg_symbol}@{r.entry_price}" for r in os_.itertuples()) \
+              if not os_.empty else ""
+        rows.append([stamp, str(day), nm, round(float(pnl), 2), len(ts_), len(os_),
+                     int(ts_.straddle_num.max()) if not ts_.empty else 0, det])
+    return append_rows("LIVE", TAB_SNAPSHOT, SNAP_HEADERS, rows)
+
+
+def replace_tab(kind, tab, headers, rows):
+    """Rewrite a tab whole. Used for the status sheet, which mirrors current
+    state rather than accumulating history."""
+    import gspread
+    sh = sheet(kind)
+    try:
+        ws = sh.worksheet(tab)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab, rows=400, cols=len(headers))
+    ws.update(values=[headers] + [[_j(v) for v in r] for r in rows],
+              value_input_option="USER_ENTERED")
+    return len(rows)
+
+
+def rows_from_df(df, headers):
+    """Read-back rows in header order, so a rewritten tab keeps its shape even
+    if a column is missing from the sheet."""
+    if df.empty:
+        return []
+    out = []
+    for _, r in df.iterrows():
+        out.append([r[h] if h in df.columns else "" for h in headers])
+    return out
+
+
+def list_tabs(kind, prefix):
+    try:
+        return sorted(w.title for w in sheet(kind).worksheets()
+                      if w.title.startswith(prefix))
+    except Exception:
+        return []
+
+
 def read_tab(kind, tab):
     import gspread
     try:
@@ -208,6 +293,7 @@ def read_tab(kind, tab):
 
 
 # ============================== MARKET DATA =================================
+# ============================== DISCORD =====================================
 def discord_url():
     try:
         return st.secrets["discord"]["webhook"]
@@ -216,6 +302,8 @@ def discord_url():
 
 
 def discord(msg, tag=""):
+    """Fire-and-forget notification. A webhook failure must never interrupt
+    the engine, so every error is swallowed after one retry."""
     url = discord_url()
     if not url:
         return False
@@ -225,7 +313,7 @@ def discord(msg, tag=""):
             r = requests.post(url, json=body, timeout=6)
             if r.status_code in (200, 204):
                 return True
-            if r.status_code == 429:
+            if r.status_code == 429:          # rate limited
                 time.sleep(float(r.headers.get("Retry-After", 2)))
                 continue
             return False
@@ -238,6 +326,9 @@ CANDLE_COLS = ["ts", "open", "high", "low", "close", "volume"]
 
 
 def empty_candles():
+    """An empty frame WITH the expected columns. A bare pd.DataFrame() has no
+    columns, so downstream `.ts` access raises AttributeError instead of just
+    being empty — which is how a failed VIX or futures fetch used to crash a run."""
     return pd.DataFrame(columns=CANDLE_COLS)
 
 
@@ -285,6 +376,7 @@ def nearest_expiry(expiries, day):
 
 
 def expiry_choices(expiries, day, n=6):
+    """Expiries on or after `day`, nearest first."""
     return [e for e in expiries if e >= day][:n]
 
 
@@ -340,6 +432,9 @@ def compute_lwma(s, p):
 
 
 def compute_loxx_hlhvb(df, period=LOXX_PERIOD, dev=LOXX_DEV):
+    """Loxx HLHVB. The MIDLINE supplies direction via its slope; band width is
+    a separate squeeze filter. Using width alone as the trend test was why
+    trend detection almost never fired."""
     me = compute_lwma(2*compute_lwma(df.close, int(period/2)) - compute_lwma(df.close, period),
                       int(period ** 0.5))
     d = (df.high-df.low).rolling(period).std(ddof=1)
@@ -411,10 +506,11 @@ class StraddleEngine:
         self._prev_trend = None
         self._diag = None
         self.log = []
-        self.notify = False
+        self.notify = False          # only the live engine turns this on
         self._logged = set()
         self.last_ts = None
 
+    # ---- data ----
     def option_df(self, day, strike, ot):
         key = (day, strike, ot)
         if key in self.cache:
@@ -430,6 +526,7 @@ class StraddleEngine:
         self.cache[key] = (sym, df)
         return self.cache[key]
 
+    # ---- signals ----
     def entry_ok(self, nifty, vix, i, now):
         if not (ENTRY_START <= now.time() <= ENTRY_END):
             return False
@@ -459,6 +556,8 @@ class StraddleEngine:
         wavg = width.rolling(LOXX_PERIOD).mean()
         close = float(sub.close.iloc[-1]); hi = float(sub.high.iloc[-1]); lo = float(sub.low.iloc[-1])
 
+        # NaN width_avg means the squeeze filter has not warmed up; skip it
+        # rather than vetoing the whole check.
         wa = wavg.iloc[-1]
         width_ok = bool(width.iloc[-1] <= wa*LOXX_WIDTH_MULT) if pd.notna(wa) else True
 
@@ -491,48 +590,49 @@ class StraddleEngine:
             return fresh
         return True
 
+    # ---- positions ----
     def deploy(self, day, spot, fut, now, idx, tag="ENTRY"):
+        if tag != "ENTRY" and now.time() > REDEPLOY_CUTOFF:
+            self.log.append(f"{self.name}: {tag} skipped — past {REDEPLOY_CUTOFF:%H:%M}")
+            return False
         if self.state.straddle_count >= MAX_STRADDLES_PER_DAY:
             return False
-        if len(self.state.open_legs)+2 > self.max_open_legs:
+        if len(self.state.open_legs) + 2 > self.max_open_legs:
             return False
 
         base_price = fut if day.weekday() == 0 else spot
-        remainder = base_price % STRIKE_STEP
-        lower_strike = int(base_price - remainder)
-        upper_strike = int(lower_strike + STRIKE_STEP)
-        
-        best_strike = None
-        best_diff = float('inf')
-        best_legs = []
-        
-        for test_strike in (lower_strike, upper_strike):
-            temp_legs = []
-            valid = True
+        atm = int(round(base_price / STRIKE_STEP) * STRIKE_STEP)
+        candidates = [atm + k * STRIKE_STEP
+                      for k in range(-STRIKE_SCAN, STRIKE_SCAN + 1)]
+
+        best_diff, best_strike, best_legs = float("inf"), None, []
+        probe = []
+        for test_strike in candidates:
+            temp_legs, valid = [], True
             for ot in ("CE", "PE"):
                 sym, df = self.option_df(day, test_strike, ot)
                 if df.empty:
-                    valid = False
-                    break
+                    valid = False; break
                 row = df[df.ts <= now]
                 if row.empty:
-                    valid = False
-                    break
+                    valid = False; break
                 temp_legs.append((sym, ot, float(row.close.iloc[-1])))
-            
-            if valid and len(temp_legs) == 2:
-                diff = abs(temp_legs[0][2] - temp_legs[1][2])
-                if diff < best_diff:
-                    best_diff = diff
-                    best_strike = test_strike
-                    best_legs = temp_legs
-                    
-        if not best_strike:
-            self.log.append(f"{self.name}: {tag} failed - no valid option data for nearby strikes.")
+            if not (valid and len(temp_legs) == 2):
+                probe.append(f"{test_strike}: no data")
+                continue
+            diff = abs(temp_legs[0][2] - temp_legs[1][2])
+            probe.append(f"{test_strike}: CE {temp_legs[0][2]:.1f} "
+                         f"PE {temp_legs[1][2]:.1f} d{diff:.1f}")
+            if diff < best_diff:
+                best_diff, best_strike, best_legs = diff, test_strike, temp_legs
+
+        self.log.append(f"{self.name}: scan (spot {base_price:.1f}, atm {atm}) — "
+                        + " | ".join(probe))
+        if best_strike is None:
+            self.log.append(f"{self.name}: {tag} failed — no option data for {candidates}")
             return False
 
-        strike = best_strike
-        legs = best_legs
+        strike, legs = best_strike, best_legs
 
         self.state.straddle_count += 1
         n = self.state.straddle_count
@@ -540,15 +640,14 @@ class StraddleEngine:
             self.state.open_legs.append(Leg(sym, ot, strike, px, px*SL_MULTIPLIER,
                                             LOT_SIZE, now, idx, straddle_num=n))
         self.log.append(f"{self.name}: {tag} straddle #{n} @ {now:%H:%M} strike {strike} "
-                        f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f} (Diff: {best_diff:.2f})")
+                        f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f}")
         if self.notify:
             ce, pe = legs[0], legs[1]
             discord(
                 f"**{self.name}** — {tag} straddle #{n}\n"
                 f"`{now:%H:%M}`  strike **{strike}**  (spot {spot:.1f})\n"
                 f"SELL `{ce[0]}` @ **{ce[2]:.2f}**  ·  SL {ce[2]*SL_MULTIPLIER:.2f}\n"
-                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*SL_MULTIPLIER:.2f}\n"
-                f"Premium Delta: {best_diff:.2f}",
+                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*SL_MULTIPLIER:.2f}",
                 tag="🟢")
         return True
 
@@ -558,7 +657,12 @@ class StraddleEngine:
             return None
         row = df[df.ts == now]
         if row.empty:
-            return None
+            # Illiquid strikes skip bars with no trades. Falling back to the
+            # newest bar at or before `now` keeps the stop evaluated instead
+            # of silently skipping it.
+            row = df[df.ts <= now].tail(1)
+            if row.empty:
+                return None
         hi, cl = float(row.high.iloc[0]), float(row.close.iloc[0])
         if hi >= leg.sl:
             return max(leg.sl, cl) if cl >= leg.sl else leg.sl
@@ -603,18 +707,9 @@ class StraddleEngine:
              and l.straddle_num == leg.straddle_num]
         return c[0] if c else None
 
-    def redeploy_after_naked(self, day, spot, fut, now, idx):
-        if self.redeploy_mode != REDEPLOY_AFTER_NAKED:
-            return
-        if self.state.open_legs or self.state.straddle_count >= MAX_STRADDLES_PER_DAY:
-            return
-        if now.time() > ENTRY_END:
-            self.log.append(f"{self.name}: naked closed {now:%H:%M}, past window")
-            return
-        if self.deploy(day, spot, fut, now, idx, tag="REDEPLOY"):
-            self.state.redeploys += 1
-
     def on_bar(self, day, nifty, i, local_i, now, spot, fut):
+        """local_i is unused; kept so run_day and the threaded engine
+        can call this identically."""
         if now.time() >= HARD_EXIT and not self.state.done:
             for leg in list(self.state.open_legs):
                 _, df = self.option_df(day, leg.strike, leg.opt_type)
@@ -664,14 +759,12 @@ class StraddleEngine:
             if leg.naked:
                 if fill is not None:
                     self.exit_leg(leg, fill, "NAKED_SL_HIT", now, i)
-                    self.redeploy_after_naked(day, spot, fut, now, i)
                     continue
                 if self.naked_reversal(leg, day, now):
                     _, df = self.option_df(day, leg.strike, leg.opt_type)
                     r = df[df.ts == now]
                     self.exit_leg(leg, float(r.close.iloc[0]) if not r.empty else leg.entry_price,
                                   "REVERSAL_EMA_CROSS", now, i)
-                    self.redeploy_after_naked(day, spot, fut, now, i)
                     continue
 
         if not self.state.open_legs and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
@@ -679,6 +772,8 @@ class StraddleEngine:
                 self.deploy(day, spot, fut, now, i)
 
     def prepare(self, day):
+        """Reset for a fresh session. Used by the threaded live engine, which
+        then feeds bars in one at a time rather than replaying the day."""
         self.state = DayState()
         self.heartbeat = []
         self.log = []
@@ -686,51 +781,127 @@ class StraddleEngine:
         self._logged = set()
         self.last_ts = None
 
-    def get_status(self, day, now, spot):
-        """Helper to compute open PnL and active leg statuses for logging"""
-        unrealised = 0
-        open_info = []
-        for leg in self.state.open_legs:
-            _, df = self.option_df(day, leg.strike, leg.opt_type)
-            r = df[df.ts <= now]
-            ltp = float(r.close.iloc[-1]) if not r.empty else leg.entry_price
-            leg_pnl = (leg.entry_price - ltp) * leg.qty
-            unrealised += leg_pnl
-            open_info.append(f"{leg.opt_type}{leg.strike}: E:{leg.entry_price:.1f} LTP:{ltp:.1f}")
-        
-        realised = self.state.pnl()
-        return {
-            "spot": spot,
-            "trend": self._prev_trend or "NONE",
-            "open_info": " | ".join(open_info) if open_info else "No Open Legs",
-            "realised_pnl": realised,
-            "unrealised_pnl": unrealised,
-            "total_pnl": realised + unrealised
-        }
+    def leg_ltp(self, day, leg, now):
+        _, df = self.option_df(day, leg.strike, leg.opt_type)
+        r = df[df.ts <= now] if not df.empty else pd.DataFrame()
+        return float(r.close.iloc[-1]) if not r.empty else leg.entry_price
 
-    def new_closed_rows(self, day, run_type="LIVE"):
+    def unrealised(self, day, now):
+        return sum((l.entry_price - self.leg_ltp(day, l, now)) * l.qty
+                   for l in self.state.open_legs)
+
+    def status_rows(self, day, now, stamp):
+        """Sheet 1 — the whole day's leg ledger, open and closed, leg-wise P&L."""
         rows = []
-        for leg in self.state.closed_legs:
-            k = f"{leg.symbol}|{leg.entry_time}|{leg.exit_time}"
+        for l in self.state.open_legs:
+            ltp = self.leg_ltp(day, l, now)
+            rows.append([stamp, str(day), self.name, "OPEN", l.straddle_num,
+                         l.symbol, l.opt_type, l.strike, l.qty,
+                         l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
+                         round(l.sl, 2), round(ltp, 2), "", "", "",
+                         round((l.entry_price - ltp) * l.qty, 2),
+                         l.naked, l.sl_tightened, l.carry_bars])
+        for l in self.state.closed_legs:
+            pnl = (l.entry_price - l.exit_price) * l.qty if l.exit_price is not None else 0
+            rows.append([stamp, str(day), self.name, "CLOSED", l.straddle_num,
+                         l.symbol, l.opt_type, l.strike, l.qty,
+                         l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
+                         round(l.sl, 2), "",
+                         l.exit_time.strftime("%H:%M:%S") if l.exit_time else "",
+                         round(l.exit_price, 2) if l.exit_price is not None else "",
+                         l.exit_reason or "", round(pnl, 2),
+                         l.naked, l.sl_tightened, l.carry_bars])
+        return rows
+
+    def log_row(self, day, now, spot, stamp):
+        """Sheet 2 — one row per strategy per 3-minute bar."""
+        detail = []
+        for l in self.state.open_legs:
+            ltp = self.leg_ltp(day, l, now)
+            detail.append(f"{l.opt_type}{l.strike} E{l.entry_price:.1f} "
+                          f"L{ltp:.1f} SL{l.sl:.1f}" + (" NAKED" if l.naked else ""))
+        real = self.state.pnl()
+        unreal = self.unrealised(day, now)
+        return [stamp, str(day), self.name, round(spot, 2),
+                self._prev_trend or "NONE", self.state.straddle_count,
+                len(self.state.open_legs), len(self.state.closed_legs),
+                round(real, 2), round(unreal, 2), round(real + unreal, 2),
+                " | ".join(detail) if detail else "flat"]
+
+    def new_trade_rows(self, day):
+        """Sheet 3 — appended once per leg, when it closes."""
+        rows = []
+        for l in self.state.closed_legs:
+            k = f"{l.symbol}|{l.entry_time}|{l.exit_time}"
             if k in self._logged:
                 continue
             self._logged.add(k)
-            pnl = (leg.entry_price-leg.exit_price)*leg.qty if leg.exit_price is not None else 0
-            rows.append([run_type, str(day), self.name, leg.straddle_num, leg.symbol,
-                         leg.opt_type, leg.strike, leg.entry_time.strftime("%H:%M:%S"),
-                         leg.exit_time.strftime("%H:%M:%S") if leg.exit_time else "",
-                         round(leg.entry_price, 2),
-                         round(leg.exit_price, 2) if leg.exit_price is not None else "",
-                         round(leg.sl, 2), leg.qty, leg.exit_reason, round(pnl, 2),
-                         leg.naked, leg.sl_tightened, leg.carry_bars])
+            pnl = (l.entry_price - l.exit_price) * l.qty if l.exit_price is not None else 0
+            rows.append([str(day), self.name, l.straddle_num, l.symbol, l.opt_type,
+                         l.strike, l.qty, l.entry_time.strftime("%H:%M:%S"),
+                         round(l.entry_price, 2), round(l.sl, 2),
+                         l.exit_time.strftime("%H:%M:%S") if l.exit_time else "",
+                         round(l.exit_price, 2) if l.exit_price is not None else "",
+                         l.exit_reason or "", round(pnl, 2),
+                         l.naked, l.sl_tightened, l.carry_bars])
         return rows
 
-    def open_rows(self, day):
-        return [[self.name, str(day), l.straddle_num, l.symbol, l.opt_type, l.strike,
-                 l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
-                 round(l.sl, 2), l.qty, l.entry_idx if l.entry_idx is not None else "",
-                 l.naked, l.naked_since if l.naked_since is not None else "",
-                 l.sl_tightened] for l in self.state.open_legs]
+    def resume_from(self, day, status_df):
+        """Rebuild state from Sheet 1 after a restart. Restores BOTH open and
+        closed legs, so realised P&L and the straddle count survive. Restoring
+        only open legs would understate P&L and could allow an extra straddle."""
+        if status_df.empty or "strategy" not in status_df.columns:
+            return 0, 0
+        d = status_df[(status_df.strategy == self.name)
+                      & (status_df.trading_date.astype(str) == str(day))]
+        if d.empty:
+            return 0, 0
+
+        def as_bool(v):
+            return str(v).strip().upper() in ("TRUE", "1", "YES")
+
+        def num(v, cast=float, default=None):
+            try:
+                if v == "" or pd.isna(v):
+                    return default
+                return cast(float(v))
+            except Exception:
+                return default
+
+        opened = closed = 0
+        for _, r in d.iterrows():
+            try:
+                t = dt.datetime.strptime(str(r.entry_time), "%H:%M:%S").time()
+                et = dt.datetime.combine(day, t)
+            except Exception:
+                et = dt.datetime.combine(day, MARKET_OPEN)
+            leg = Leg(symbol=str(r.leg_symbol), opt_type=str(r.opt_type),
+                      strike=int(num(r.strike, int, 0)),
+                      entry_price=num(r.entry_price, float, 0.0),
+                      sl=num(r.sl, float, 0.0),
+                      qty=int(num(r.qty, int, LOT_SIZE)),
+                      entry_time=et, entry_idx=0,
+                      straddle_num=int(num(r.straddle_num, int, 1)),
+                      naked=as_bool(r.naked), sl_tightened=as_bool(r.sl_tightened))
+            if str(r.status).upper() == "CLOSED":
+                leg.exit_price = num(r.exit_price, float, leg.entry_price)
+                leg.exit_reason = str(r.exit_reason) or "RESUMED"
+                try:
+                    xt = dt.datetime.strptime(str(r.exit_time), "%H:%M:%S").time()
+                    leg.exit_time = dt.datetime.combine(day, xt)
+                except Exception:
+                    leg.exit_time = et
+                self.state.closed_legs.append(leg)
+                self._logged.add(f"{leg.symbol}|{leg.entry_time}|{leg.exit_time}")
+                closed += 1
+            else:
+                self.state.open_legs.append(leg)
+                opened += 1
+
+        nums = [l.straddle_num for l in self.state.open_legs + self.state.closed_legs]
+        if nums:
+            self.state.straddle_count = max(nums)
+        return opened, closed
 
     def run_day(self, day, nifty, vix, fut, finalize=True):
         self.state = DayState(); self.heartbeat = []; self.log = []; self._prev_trend = None
@@ -747,6 +918,9 @@ class StraddleEngine:
                 else empty_candles()
             self.on_bar(day, nifty, i, li, now,
                         spot, float(fr.close.iloc[-1]) if not fr.empty else spot)
+        # Only force-close when the session is actually over. On a mid-session
+        # run these legs are still live — booking them at entry price would
+        # invent zero-P&L exits that never happened.
         if finalize:
             for leg in list(self.state.open_legs):
                 self.exit_leg(leg, leg.entry_price, "FORCED_DAY_END",
@@ -756,6 +930,8 @@ class StraddleEngine:
 # ============================== RUN ==========================================
 def run_dates(dates, run_type, variants, expiry_override=None,
               finalize=True, progress=None):
+    """Backtest driver. Returns the same three shapes the live engine writes:
+    trade rows, a per-day-per-strategy summary, heartbeat, and open legs."""
     smart = angel_login()
     lookup, expiries = option_universe()
     first, last = min(dates), max(dates)
@@ -771,14 +947,14 @@ def run_dates(dates, run_type, variants, expiry_override=None,
     warm = int((nifty.ts.dt.date < first).sum())
     notes = []
     if vix.empty:
-        notes.append("India VIX returned no candles — the VIX entry filter cannot pass, "
-                     "so no trades will be taken. Check the VIX token.")
+        notes.append("India VIX returned no candles — the VIX entry filter cannot "
+                     "pass, so no trades will be taken.")
     if fut.empty:
-        notes.append("NIFTY futures returned no candles — Monday strike selection will "
-                     "fall back to spot. Check NIFTY_FUT_TOKEN after each roll.")
+        notes.append("NIFTY futures returned no candles — Monday strike selection "
+                     "falls back to spot. Check NIFTY_FUT_TOKEN after each roll.")
     if warm < FULL_WARMUP_BARS:
         notes.append(f"Only {warm} warm-up bars (want {FULL_WARMUP_BARS}); the Loxx "
-                     "squeeze filter will be skipped early in the day.")
+                     "squeeze filter is skipped early in the day.")
 
     trades, summary, hb, logs, open_legs = [], [], [], [], []
     cache = {}
@@ -788,33 +964,26 @@ def run_dates(dates, run_type, variants, expiry_override=None,
                    for nm, dyn, rd, ml in variants]
         for e in engines:
             e.run_day(day, nifty, vix, fut, finalize=finalize)
-            for leg in e.state.closed_legs:
-                pnl = (leg.entry_price-leg.exit_price)*leg.qty if leg.exit_price is not None else 0
-                trades.append([run_type, str(day), e.name, leg.straddle_num, leg.symbol,
-                               leg.opt_type, leg.strike, leg.entry_time.strftime("%H:%M:%S"),
-                               leg.exit_time.strftime("%H:%M:%S") if leg.exit_time else "",
-                               round(leg.entry_price, 2),
-                               round(leg.exit_price, 2) if leg.exit_price is not None else "",
-                               round(leg.sl, 2), leg.qty, leg.exit_reason, round(pnl, 2),
-                               leg.naked, leg.sl_tightened, leg.carry_bars])
+            trades += e.new_trade_rows(day)
             summary.append([run_type, e.name, str(day), round(e.state.pnl(), 2),
                             len(e.state.closed_legs), e.state.straddle_count,
                             sum(1 for l in e.state.closed_legs if l.naked),
                             sum(1 for l in e.state.closed_legs
                                 if l.exit_reason == "REVERSAL_EMA_CROSS"),
                             e.state.redeploys])
-            for leg in e.state.open_legs:
-                open_legs.append([e.name, leg.straddle_num, leg.symbol, leg.opt_type,
-                                  leg.strike, leg.entry_time.strftime("%H:%M:%S"),
-                                  round(leg.entry_price, 2), round(leg.sl, 2),
-                                  leg.naked, leg.sl_tightened])
+            for l in e.state.open_legs:
+                open_legs.append([e.name, l.straddle_num, l.symbol, l.opt_type,
+                                  l.strike, l.entry_time.strftime("%H:%M:%S"),
+                                  round(l.entry_price, 2), round(l.sl, 2),
+                                  l.naked, l.sl_tightened])
             hb += e.heartbeat
             logs += e.log
         if progress:
             progress.progress((n+1)/len(dates), text=f"{day} ({n+1}/{len(dates)})")
+
     O = pd.DataFrame(open_legs, columns=["strategy", "straddle_num", "leg_symbol",
-                                        "opt_type", "strike", "entry_time",
-                                        "entry_price", "sl", "naked", "sl_tightened"])
+                                         "opt_type", "strike", "entry_time",
+                                         "entry_price", "sl", "naked", "sl_tightened"])
     return (pd.DataFrame(trades, columns=TRADE_HEADERS),
             pd.DataFrame(summary, columns=SUMMARY_HEADERS),
             pd.DataFrame(hb, columns=HEARTBEAT_HEADERS), O), logs, notes, None
@@ -823,25 +992,25 @@ def run_dates(dates, run_type, variants, expiry_override=None,
 # ============================== UI ===========================================
 # ============================== THREADED LIVE ENGINE ========================
 def _seconds_to_next_bar(now):
+    """Sleep target: the next 3-minute boundary plus a buffer, so the bar has
+    actually closed broker-side before we ask for it."""
     secs = (CANDLE_MIN - (now.minute % CANDLE_MIN)) * 60 - now.second
     if secs <= 0:
         secs = CANDLE_MIN * 60
     return secs + POLL_BUFFER_SEC
 
 
-def _replace_open_positions(sh_rows, day):
-    import gspread
-    sh = sheet("LIVE")
-    try:
-        ws = sh.worksheet(TAB_OPEN)
-        ws.clear()
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TAB_OPEN, rows=200, cols=len(OPEN_HEADERS))
-    ws.update(values=[OPEN_HEADERS] + [[_j(v) for v in r] for r in sh_rows],
-              value_input_option="USER_ENTERED")
-
-
 def live_engine_loop(stop_event, expiry, status, notify_on=False):
+    """Daemon thread. Wakes just after each 3-minute close, feeds unseen bars
+    into every engine, then writes the three sheets:
+
+      Sheet 1  Live_Status        rewritten whole — current leg ledger
+      Sheet 2  Log_<date>         appended — one row per strategy per bar
+      Sheet 3  Trades_<date>      appended — one row per leg on close
+
+    On startup it reads Sheet 1 and resumes that day's state, so a container
+    restart continues rather than beginning flat.
+    """
     day = today_ist()
     status["state"] = "starting"
     status["log"] = []
@@ -855,57 +1024,39 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
         cache = {}
         engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
                    for nm, dyn, rd, ml in VARIANTS_LIVE]
-                   
-        open_df = pd.DataFrame()
-        try:
-            open_df = read_tab("LIVE", TAB_OPEN)
-        except Exception as e:
-            note(f"No previous state found or sheet missing: {e}")
-            
-        if not open_df.empty and "trading_date" in open_df.columns:
-            open_df = open_df[open_df["trading_date"] == str(day)]
 
+        try:
+            prev = read_tab("LIVE", TAB_STATUS)
+        except Exception as e:
+            prev = pd.DataFrame()
+            note(f"could not read {TAB_STATUS}: {e}")
+
+        # Sheet 1 accumulates. Previous days are held in memory and rewritten
+        # ahead of today's rows each cycle, so history is preserved while
+        # today's block stays current. Read once here rather than every cycle.
+        carry_rows = []
+        if not prev.empty and "trading_date" in prev.columns:
+            older = prev[prev.trading_date.astype(str) != str(day)]
+            carry_rows = rows_from_df(older, STATUS_HEADERS)
+            if carry_rows:
+                note(f"{TAB_STATUS}: carrying {len(carry_rows)} row(s) "
+                     f"from {older.trading_date.nunique()} earlier day(s)")
+
+        resumed_open = resumed_closed = 0
         for e in engines:
             e.prepare(day)
             e.notify = notify_on
-            
-            if not open_df.empty:
-                e_open = open_df[open_df["strategy"] == e.name]
-                for _, row in e_open.iterrows():
-                    try:
-                        time_obj = dt.datetime.strptime(str(row["entry_time"]), "%H:%M:%S").time()
-                        entry_time = dt.datetime.combine(day, time_obj)
-                    except Exception:
-                        entry_time = now_ist()
-                        
-                    leg = Leg(
-                        symbol=str(row["leg_symbol"]),
-                        opt_type=str(row["opt_type"]),
-                        strike=int(row["strike"]),
-                        entry_price=float(row["entry_price"]),
-                        sl=float(row["sl"]),
-                        qty=int(row["qty"]) if "qty" in row and pd.notna(row["qty"]) else LOT_SIZE,
-                        entry_time=entry_time,
-                        entry_idx=int(row["entry_idx"]) if "entry_idx" in row and pd.notna(row["entry_idx"]) and str(row["entry_idx"]).isdigit() else 0,
-                        straddle_num=int(row["straddle_num"]),
-                        naked=bool(row["naked"]),
-                        naked_since=int(row["naked_since"]) if pd.notna(row["naked_since"]) and str(row["naked_since"]).isdigit() else None,
-                        sl_tightened=bool(row["sl_tightened"])
-                    )
-                    e.state.open_legs.append(leg)
-                
-                if e.state.open_legs:
-                    e.state.straddle_count = max([l.straddle_num for l in e.state.open_legs])
-                    
-        resume_count = sum(len(e.state.open_legs) for e in engines)
-        msg = f"engine up · expiry {expiry} · {len(engines)} variants"
-        if resume_count > 0:
-            msg += f" · resumed {resume_count} live legs"
-        note(msg)
+            o, c = e.resume_from(day, prev)
+            resumed_open += o
+            resumed_closed += c
 
+        msg = f"engine up · expiry {expiry} · {len(engines)} variants"
+        if resumed_open or resumed_closed:
+            msg += f" · resumed {resumed_open} open / {resumed_closed} closed legs"
+        note(msg)
         if notify_on:
             discord(f"**Straddle Desk started**\n`{day}`  expiry `{expiry}`\n"
-                    f"Resumed open legs: {resume_count}\n"
+                    f"resumed: {resumed_open} open, {resumed_closed} closed\n"
                     f"variants: {', '.join(e.name for e in engines)}", tag="🚀")
     except Exception as e:
         status["state"] = "failed"
@@ -930,11 +1081,12 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
         while now_ist() < target:
             if stop_event.is_set():
                 note("stopped from the dashboard")
-                status["state"] = "stopped"
                 if notify_on:
                     discord("**Engine stopped from the dashboard**", tag="🛑")
-                return
+                break
             time.sleep(1)
+        if stop_event.is_set():
+            break                    # fall through to finalisation, not return
 
         try:
             now = now_ist()
@@ -942,14 +1094,14 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
                                       MARKET_OPEN)
             nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, now)
             if nifty.empty:
-                note("no candles returned — retrying next cycle")
+                note("no NIFTY candles — retrying next cycle")
                 continue
             vix = candles(smart, INDIA_VIX_TOKEN, NSE, frm, now)
             fut = candles(smart, NIFTY_FUT_TOKEN, NFO, frm, now)
             if vix.empty:
                 note("VIX empty this cycle — entry filter cannot pass")
             if fut.empty:
-                note("futures empty this cycle — using spot for strike selection")
+                note("futures empty this cycle — using spot for strikes")
 
             mask = nifty.ts.dt.date == day
             pos = np.flatnonzero(mask.to_numpy())
@@ -957,89 +1109,88 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
                 note("waiting for the session to produce bars")
                 continue
 
-            pos = pos[:-1]
-            new = [p for p in pos if last_ts is None or nifty.ts.iloc[p] > last_ts]
-            if not new:
-                note("no new completed bar yet")
-                continue
+            pos = pos[:-1]                       # drop the forming candle
+            new_bars = [p for p in pos if last_ts is None or nifty.ts.iloc[p] > last_ts]
 
-            # CRITICAL FIX: Clear the option cache in the live loop so the engine 
-            # fetches fresh LTPs for the exact current minute rather than stale morning data.
+            # Option prices must be fresh each cycle, so the shared candle
+            # cache is dropped before evaluating.
             cache.clear()
 
-            for p in new:
-                i = int(p)
-                bar_ts = nifty.ts.iloc[i]
-                spot = float(nifty.close.iloc[i])
-                fr = fut[fut.ts <= bar_ts] if ("ts" in fut.columns and not fut.empty) \
-                    else empty_candles()
-                fv = float(fr.close.iloc[-1]) if not fr.empty else spot
-                for e in engines:
-                    e._vix = vix
-                    e.on_bar(day, nifty, i, None, bar_ts, spot, fv)
-                last_ts = bar_ts
+            spot = float(nifty.close.iloc[int(pos[-1])])
+            if new_bars:
+                for p in new_bars:
+                    i = int(p)
+                    bar_ts = nifty.ts.iloc[i]
+                    spot = float(nifty.close.iloc[i])
+                    fr = fut[fut.ts <= bar_ts] if ("ts" in fut.columns and not fut.empty) \
+                        else empty_candles()
+                    fv = float(fr.close.iloc[-1]) if not fr.empty else spot
+                    for e in engines:
+                        e._vix = vix
+                        e.on_bar(day, nifty, i, None, bar_ts, spot, fv)
+                    last_ts = bar_ts
+                note(f"processed to {last_ts:%H:%M}")
+            else:
+                note("no new completed bar yet")
 
-            note(f"processed to {last_ts:%H:%M}")
+            stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            mark = last_ts if last_ts is not None else nifty.ts.iloc[int(pos[-1])]
 
+            # Sheet 3 — closed legs, appended once each
             wrote = 0
             for e in engines:
-                rows = e.new_closed_rows(day)
+                rows = e.new_trade_rows(day)
                 if rows:
-                    wrote += append_rows("LIVE", TAB_TRADES, TRADE_HEADERS, rows)
-            open_rows = [r for e in engines for r in e.open_rows(day)]
-            _replace_open_positions(open_rows, day)
+                    wrote += append_rows("LIVE", tab_trades(day), TRADE_HEADERS, rows)
             if wrote:
-                note(f"{wrote} closed leg(s) written")
+                note(f"{wrote} leg(s) -> {tab_trades(day)}")
 
-            # Execute 3-Minute Status Logging
-            log_rows = []
-            for e in engines:
-                st_data = e.get_status(day, last_ts, spot)
-                log_rows.append([
-                    last_ts.strftime("%Y-%m-%d %H:%M:%S"),
-                    str(day),
-                    e.name,
-                    round(st_data["spot"], 2),
-                    st_data["trend"],
-                    e.state.straddle_count,
-                    st_data["open_info"],
-                    round(st_data["realised_pnl"], 2),
-                    round(st_data["unrealised_pnl"], 2),
-                    round(st_data["total_pnl"], 2)
-                ])
-            append_rows("LIVE", TAB_LOG, LOG_HEADERS, log_rows)
+            # Sheet 2 — 3-minute log
+            append_rows("LIVE", tab_log(day), LOG_HEADERS,
+                        [e.log_row(day, mark, spot, stamp) for e in engines])
 
-            status["summary"] = {e.name: dict(pnl=round(e.state.pnl(), 2),
-                                              closed=len(e.state.closed_legs),
-                                              open=len(e.state.open_legs),
-                                              straddles=e.state.straddle_count)
-                                 for e in engines}
-            status["last_bar"] = f"{last_ts:%H:%M}"
+            # Sheet 1 — running ledger: earlier days kept, today refreshed
+            replace_tab("LIVE", TAB_STATUS, STATUS_HEADERS,
+                        carry_rows
+                        + [r for e in engines for r in e.status_rows(day, mark, stamp)])
+
+            status["summary"] = {
+                e.name: dict(realised=round(e.state.pnl(), 2),
+                             unrealised=round(e.unrealised(day, mark), 2),
+                             total=round(e.state.pnl() + e.unrealised(day, mark), 2),
+                             closed=len(e.state.closed_legs),
+                             open=len(e.state.open_legs),
+                             straddles=e.state.straddle_count)
+                for e in engines}
+            status["last_bar"] = f"{mark:%H:%M}"
+            status["spot"] = round(spot, 2)
         except Exception as e:
             note(f"cycle error: {type(e).__name__}: {e}")
             time.sleep(5)
 
+    # ---- finalisation: runs on market close AND on a manual stop ----
     try:
-        rows = []
+        now = now_ist()
+        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        mark = last_ts if last_ts is not None else now
+        wrote = 0
         for e in engines:
-            rows.append(["LIVE", e.name, str(day), round(e.state.pnl(), 2),
-                         len(e.state.closed_legs), e.state.straddle_count,
-                         sum(1 for l in e.state.closed_legs if l.naked),
-                         sum(1 for l in e.state.closed_legs
-                             if l.exit_reason == "REVERSAL_EMA_CROSS"),
-                         e.state.redeploys])
-            hb = e.heartbeat
-            if hb:
-                append_rows("LIVE", TAB_HEARTBEAT, HEARTBEAT_HEADERS, hb)
-        append_rows("LIVE", TAB_SUMMARY, SUMMARY_HEADERS, rows)
-        _replace_open_positions([], day)
-        note("daily summary written")
-        status["state"] = "finished"
+            rows = e.new_trade_rows(day)
+            if rows:
+                wrote += append_rows("LIVE", tab_trades(day), TRADE_HEADERS, rows)
+            if e.heartbeat:
+                append_rows("LIVE", f"Heartbeat_{day}", HEARTBEAT_HEADERS, e.heartbeat)
+        replace_tab("LIVE", TAB_STATUS, STATUS_HEADERS,
+                    carry_rows
+                    + [r for e in engines for r in e.status_rows(day, mark, stamp)])
+        note(f"finalised · {wrote} late leg(s) written · "
+             f"{len(carry_rows)} earlier row(s) preserved")
+        status["state"] = "stopped" if stop_event.is_set() else "finished"
         if notify_on:
-            lines = [f"**{e.name}**  {e.state.pnl():+,.0f}  "
-                     f"({len(e.state.closed_legs)} legs, "
-                     f"{e.state.straddle_count} straddles)" for e in engines]
-            discord(f"**Session complete** `{day}`\n" + "\n".join(lines), tag="🏁")
+            lines = [f"**{e.name}**  realised {e.state.pnl():+,.0f}  "
+                     f"({len(e.state.closed_legs)} closed, "
+                     f"{len(e.state.open_legs)} open)" for e in engines]
+            discord(f"**Session ended** `{day}`\n" + "\n".join(lines), tag="🏁")
     except Exception as e:
         note(f"final write failed: {type(e).__name__}: {e}")
         status["state"] = "finished_with_errors"
@@ -1059,6 +1210,9 @@ html, body, [class*="css"], .stMarkdown, p, div, span, label
 #MainMenu, footer { visibility:hidden; }
 header[data-testid="stHeader"] { background:transparent; height:0; }
 
+/* The sidebar is pinned open. Hiding the header also hid Streamlit's expand
+   arrow, so a stray click on collapse left no way back — the collapse control
+   is removed instead and the panel forced visible. */
 [data-testid="stSidebarCollapseButton"],
 [data-testid="collapsedControl"],
 button[kind="header"] { display:none !important; }
@@ -1072,6 +1226,8 @@ section[data-testid="stSidebar"] {
 section[data-testid="stSidebar"][aria-expanded="false"] {
   visibility:visible !important; transform:none !important; }
 
+/* On a phone a pinned 290px panel would swallow the screen, so let it behave
+   normally there and restore the expand control. */
 @media (max-width:640px) {
   section[data-testid="stSidebar"] { min-width:0 !important; width:auto !important; }
   [data-testid="stSidebarCollapseButton"],
@@ -1093,6 +1249,7 @@ section[data-testid="stSidebar"] .block-container { padding-top:1.6rem; }
 .brand-sub { font-size:.72rem; color:#b9a8d4; margin-bottom:1.5rem;
   letter-spacing:.04em; text-transform:uppercase; font-weight:600; }
 
+/* nav: turn the radio group into nav rows */
 section[data-testid="stSidebar"] div[role="radiogroup"] { gap:.3rem; }
 section[data-testid="stSidebar"] div[role="radiogroup"] > label {
   background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.06);
@@ -1185,7 +1342,7 @@ div[data-baseweb="select"]>div, div[data-testid="stDateInput"] input {
 </style>
 """
 
-GRADS = {"FIXED_1_3X": "g1", "DYNAMIC_SL": "g2", "NAKED_CARRY": "g3"}
+GRADS = {"FIXED_1_3X": "g1", "DYNAMIC_SL": "g2"}
 
 
 def kpi(label, value, footnote="", grad="g1"):
@@ -1207,6 +1364,8 @@ def empty_state(title, sub, ico="◇"):
 
 
 def header(title, tag="", live=False):
+    """tag is accepted and ignored — the header subtitle was removed on
+    request. Kept in the signature so existing call sites still work."""
     dot = "dot-live" if live else "dot-off"
     when = f"{now_ist():%H:%M}"
     txt = f"Session open · {when}" if live else f"Session closed · {when}"
@@ -1228,6 +1387,7 @@ def expiries_for(day):
 
 
 def equity_chart(S):
+    """Cumulative P&L per variant."""
     if S.empty:
         return None
     d = S.copy()
@@ -1242,13 +1402,14 @@ def equity_chart(S):
                             axis=alt.Axis(gridColor="#f4e9f0", labelColor="#9b8aa6")),
                     color=alt.Color("strategy:N", title=None,
                                     scale=alt.Scale(domain=list(GRADS),
-                                                    range=["#ec4899", "#8b5cf6", "#0ea5e9"]),
+                                                    range=["#ec4899", "#8b5cf6"]),
                                     legend=alt.Legend(orient="top")),
                     tooltip=["trading_date:T", "strategy:N", "cum:Q", "total_pnl:Q"])
             .properties(height=260).configure_view(strokeWidth=0))
 
 
 def reason_chart(T):
+    """Exit reasons by count."""
     if T.empty or "exit_reason" not in T.columns:
         return None
     g = T.groupby("exit_reason").size().reset_index(name="n")
@@ -1336,37 +1497,6 @@ def render_kpis(S, variants, note=""):
                         "g4" if n else "gmute"), unsafe_allow_html=True)
 
 
-def render_run(T, S, H, O, variants, kind, write):
-    if not S.empty:
-        render_kpis(S, variants)
-    if not O.empty:
-        st.markdown(panel("Still open",
-                    "session unfinished — these are live, not written to the sheet"),
-                    unsafe_allow_html=True)
-        st.dataframe(O, use_container_width=True, hide_index=True)
-    if not T.empty:
-        a, b = st.columns([1.9, 1])
-        with a:
-            st.markdown(panel("Closed legs", f"{len(T)} recorded"),
-                        unsafe_allow_html=True)
-            st.dataframe(T.drop(columns=["run_type"], errors="ignore"),
-                         use_container_width=True, hide_index=True, height=300)
-        with b:
-            ch = reason_chart(T)
-            if ch is not None:
-                st.markdown(panel("Exit reasons"), unsafe_allow_html=True)
-                st.altair_chart(ch, use_container_width=True)
-    if T.empty and O.empty:
-        st.markdown(empty_state("No trades", "Entry conditions were not met.", "○"),
-                    unsafe_allow_html=True)
-    if write and not T.empty:
-        append_rows(kind, TAB_TRADES, TRADE_HEADERS, T.values.tolist())
-        append_rows(kind, TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
-        if not H.empty:
-            append_rows(kind, TAB_HEARTBEAT, HEARTBEAT_HEADERS, H.values.tolist())
-        st.success(f"{len(T)} legs written.")
-
-
 # ================================ LIVE ======================================
 if page == "Live run":
     st.markdown(header("Live run", "FIXED_1_3X · DYNAMIC_SL — paper, no orders placed",
@@ -1441,22 +1571,27 @@ if page == "Live run":
         st.dataframe(det, use_container_width=True, hide_index=True)
     else:
         try:
-            S = read_tab("LIVE", TAB_SUMMARY)
+            ST = read_tab("LIVE", TAB_STATUS)
         except Exception:
-            S = pd.DataFrame()
-        if S.empty:
+            ST = pd.DataFrame()
+        if ST.empty:
             render_kpis(pd.DataFrame(columns=["strategy", "total_pnl", "num_legs",
                                               "trading_date"]), VARIANTS_LIVE)
             st.markdown(empty_state("Nothing recorded yet",
-                        "Start the engine and it will log each bar close.", "◇"),
+                        "Start the engine — it writes the status sheet each bar.", "◇"),
                         unsafe_allow_html=True)
         else:
-            S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
-            render_kpis(S, VARIANTS_LIVE, "to date")
-            ch = equity_chart(S)
-            if ch is not None:
-                st.markdown(panel("Cumulative P&L", "live record"), unsafe_allow_html=True)
-                st.altair_chart(ch, use_container_width=True)
+            ST["leg_pnl"] = pd.to_numeric(ST.leg_pnl, errors="coerce").fillna(0)
+            agg = (ST.groupby("strategy")
+                     .agg(total_pnl=("leg_pnl", "sum"), num_legs=("leg_pnl", "size"))
+                     .reset_index())
+            agg["trading_date"] = ST.trading_date.iloc[0] if len(ST) else str(TODAY)
+            render_kpis(agg, VARIANTS_LIVE,
+                        f"{ST.trading_date.iloc[0]}" if len(ST) else "")
+            st.markdown(panel("Leg ledger",
+                        f"Sheet 1 · updated {ST.updated_at.iloc[-1]}"),
+                        unsafe_allow_html=True)
+            st.dataframe(ST, use_container_width=True, hide_index=True, height=320)
 
     lg = status.get("log")
     if lg:
@@ -1469,8 +1604,7 @@ if page == "Live run":
 
 # ================================ BACKTEST =================================
 elif page == "Backtest":
-    st.markdown(header("Backtest", "FIXED_1_3X · DYNAMIC_SL · NAKED_CARRY — "
-                       "one shared data feed", SESSION_LIVE), unsafe_allow_html=True)
+    st.markdown(header("Backtest", "", SESSION_LIVE), unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
     mode = c1.radio("Range", ["Single day", "Date range"], key="bt_mode",
                     horizontal=True)
@@ -1545,11 +1679,15 @@ elif page == "Backtest":
                             e2.download_button("Download heartbeat", H.to_csv(index=False),
                                                "straddle_heartbeat.csv", "text/csv")
                         if save:
-                            append_rows("BACKTEST", TAB_TRADES, TRADE_HEADERS, T.values.tolist())
-                            append_rows("BACKTEST", TAB_SUMMARY, SUMMARY_HEADERS, S.values.tolist())
+                            for _d, _g in T.groupby("trading_date"):
+                                append_rows("BACKTEST", tab_trades(_d), TRADE_HEADERS,
+                                            _g.values.tolist())
+                            append_rows("BACKTEST", "Backtest_Summary",
+                                        SUMMARY_HEADERS, S.values.tolist())
                             if not H.empty:
-                                append_rows("BACKTEST", TAB_HEARTBEAT, HEARTBEAT_HEADERS,
-                                            H.values.tolist())
+                                for _d, _g in H.groupby("trading_date"):
+                                    append_rows("BACKTEST", f"Heartbeat_{_d}",
+                                                HEARTBEAT_HEADERS, _g.values.tolist())
                             st.success("Written to the backtest sheet.")
                     with st.expander("Engine log"):
                         st.code("\n".join(logs) or "(nothing)")
@@ -1566,29 +1704,41 @@ else:
     c1, c2 = st.columns([1.4, 1])
     src = c1.radio("Source", ["Live", "Backtest"], horizontal=True)
     kind = "LIVE" if src == "Live" else "BACKTEST"
-    variants = VARIANTS_LIVE if kind == "LIVE" else VARIANTS_BACKTEST
     with c2:
         st.write("")
         load = st.button("Load")
     if load:
-        try:
-            S = read_tab(kind, TAB_SUMMARY)
-        except Exception as e:
-            st.error(f"{type(e).__name__}: {e}"); S = pd.DataFrame()
-        if S.empty:
-            st.markdown(empty_state("Nothing recorded", f"The {src.lower()} sheet is empty.",
-                        "◇"), unsafe_allow_html=True)
+        tabs = list_tabs(kind, "Trades_")
+        if not tabs:
+            st.markdown(empty_state("Nothing recorded",
+                        f"No Trades_<date> tabs in the {src.lower()} sheet.", "◇"),
+                        unsafe_allow_html=True)
         else:
-            S["total_pnl"] = pd.to_numeric(S.total_pnl, errors="coerce")
-            render_kpis(S, variants, f"{S.trading_date.nunique()} recorded")
-            ch = equity_chart(S)
-            if ch is not None:
-                st.markdown(panel("Cumulative P&L"), unsafe_allow_html=True)
-                st.altair_chart(ch, use_container_width=True)
-            st.markdown(panel("Sessions"), unsafe_allow_html=True)
-            st.dataframe(S.tail(80), use_container_width=True, hide_index=True)
-            st.download_button("Download summary", S.to_csv(index=False),
-                               f"{kind.lower()}_summary.csv", "text/csv")
+            frames = []
+            for t in tabs:
+                d = read_tab(kind, t)
+                if not d.empty:
+                    frames.append(d)
+            if not frames:
+                st.markdown(empty_state("Nothing recorded", "Tabs exist but are empty.",
+                            "◇"), unsafe_allow_html=True)
+            else:
+                A = pd.concat(frames, ignore_index=True)
+                A["pnl"] = pd.to_numeric(A.pnl, errors="coerce").fillna(0)
+                S = (A.groupby(["strategy", "trading_date"])
+                       .agg(total_pnl=("pnl", "sum"), num_legs=("pnl", "size"))
+                       .reset_index())
+                render_kpis(S, VARIANTS_LIVE,
+                            f"{S.trading_date.nunique()} sessions")
+                ch = equity_chart(S)
+                if ch is not None:
+                    st.markdown(panel("Cumulative P&L",
+                                f"{len(tabs)} day tab(s)"), unsafe_allow_html=True)
+                    st.altair_chart(ch, use_container_width=True)
+                st.markdown(panel("Per-leg trades"), unsafe_allow_html=True)
+                st.dataframe(A.tail(200), use_container_width=True, hide_index=True)
+                st.download_button("Download all trades", A.to_csv(index=False),
+                                   f"{kind.lower()}_trades.csv", "text/csv")
     else:
         st.markdown(empty_state("Ready", "Choose a source and press Load.", "◈"),
                     unsafe_allow_html=True)
