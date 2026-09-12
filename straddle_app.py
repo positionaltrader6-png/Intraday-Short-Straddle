@@ -1652,6 +1652,62 @@ with st.sidebar:
         f'<b>{ENTRY_START:%H:%M}-{ENTRY_END:%H:%M}</b></div>'
         f'<div class="side-kv"><span>Hard exit</span><b>{HARD_EXIT:%H:%M}</b></div>',
         unsafe_allow_html=True)
+    st.markdown('<div class="side-sep"></div><div class="side-lbl">Stop-loss rules</div>',
+                unsafe_allow_html=True)
+
+    _engine_live = live_engine_thread() is not None
+    if _engine_live:
+        st.caption("Locked while the engine is running — stop it to change these.")
+
+    with st.expander("Adjust", expanded=False):
+        _slm = st.slider("Base SL (x premium)", 1.10, 1.60, SL_MULTIPLIER, 0.05,
+                         disabled=_engine_live)
+        _tsm = st.slider("Tightened SL (x premium)", 1.05, 1.50,
+                         TIGHT_SL_MULTIPLIER, 0.05, disabled=_engine_live,
+                         help="Applied to the hurt leg when DYNAMIC_SL confirms a trend.")
+        _fas = st.checkbox("Fill at the stop level", SL_FILL_AT_STOP,
+                           disabled=_engine_live,
+                           help="Off = fill at the candle close when the bar closed "
+                                "beyond the stop. On 11 Sep the two differed by 4,415.")
+        _slip = st.number_input("Slippage on an SL fill (points)", 0.0, 20.0,
+                                SL_SLIPPAGE_PTS, 0.5, disabled=_engine_live)
+
+        st.markdown("**Naked leg**")
+        _nm = st.selectbox(
+            "Behaviour", ["EMA_TRAIL", "EMA_CROSS_EXIT", "FIXED"],
+            index=["EMA_TRAIL", "EMA_CROSS_EXIT", "FIXED"].index(NAKED_MODE),
+            disabled=_engine_live,
+            help="EMA_TRAIL: stop ratchets down to the 21 EMA.  "
+                 "EMA_CROSS_EXIT: exit on a close above the 21 EMA, stop stays put.  "
+                 "FIXED: no trail and no cross exit.")
+        _nt = st.selectbox(
+            "Trail trigger", ["HIGH", "CLOSE"],
+            index=["HIGH", "CLOSE"].index(NAKED_TRAIL_TRIGGER),
+            disabled=_engine_live or _nm != "EMA_TRAIL",
+            help="HIGH fires on any wick — 2.3x as often as a close on real "
+                 "3-min data (~20 vs ~9 per session).")
+        _nb = st.slider("Trail buffer above the EMA (%)", 0.0, 20.0,
+                        NAKED_TRAIL_BUFFER_PCT, 1.0,
+                        disabled=_engine_live or _nm != "EMA_TRAIL")
+        _nr = st.checkbox("Re-base stop to LTP x base SL when the partner stops out",
+                          NAKED_REBASE_ON_PARTNER_SL, disabled=_engine_live)
+
+    if not _engine_live:
+        globals().update(SL_MULTIPLIER=_slm, TIGHT_SL_MULTIPLIER=_tsm,
+                         SL_FILL_AT_STOP=_fas, SL_SLIPPAGE_PTS=_slip,
+                         NAKED_MODE=_nm, NAKED_TRAIL_TRIGGER=_nt,
+                         NAKED_TRAIL_BUFFER_PCT=_nb,
+                         NAKED_REBASE_ON_PARTNER_SL=_nr)
+
+    st.markdown(
+        f'<div class="side-kv"><span>Naked</span><b>{NAKED_MODE.replace("_"," ").title()}'
+        f'</b></div>'
+        f'<div class="side-kv"><span>Trigger</span><b>{NAKED_TRAIL_TRIGGER}</b></div>'
+        f'<div class="side-kv"><span>SL fill</span>'
+        f'<b>{"at stop" if SL_FILL_AT_STOP else "at close"}'
+        f'{f" +{SL_SLIPPAGE_PTS:g}" if SL_FILL_AT_STOP and SL_SLIPPAGE_PTS else ""}</b></div>',
+        unsafe_allow_html=True)
+
     st.markdown('<div class="side-sep"></div><div class="side-lbl">Alerts</div>',
                 unsafe_allow_html=True)
     _hook = discord_url()
@@ -1848,8 +1904,53 @@ elif page == "Backtest":
                                             format_func=lambda d: f"{d:%d %b %Y}",
                                             key="exp_bt")
     save = c6.checkbox("Save to sheet", value=False)
-    st.caption(f"{len(days)} weekday(s) selected")
-    run_bt = st.button("Run backtest", type="primary")
+    st.caption(f"{len(days)} weekday(s) selected · rules: naked "
+               f"**{NAKED_MODE}** / trigger **{NAKED_TRAIL_TRIGGER}** · SL fill "
+               f"**{'at stop' if SL_FILL_AT_STOP else 'at close'}"
+               f"{f' +{SL_SLIPPAGE_PTS:g}' if SL_FILL_AT_STOP else ''}** · "
+               f"base **{SL_MULTIPLIER:g}x** — change these in the sidebar")
+
+    b1, b2 = st.columns([1, 1])
+    run_bt = b1.button("Run backtest", type="primary")
+    sweep = b2.button("Compare naked modes")
+
+    if sweep:
+        if not days:
+            st.warning("No weekdays selected.")
+        else:
+            rows = []
+            p = st.progress(0.0, text="sweeping")
+            combos = [("EMA_TRAIL", "HIGH"), ("EMA_TRAIL", "CLOSE"),
+                      ("EMA_CROSS_EXIT", "HIGH"), ("FIXED", "HIGH")]
+            keep = (NAKED_MODE, NAKED_TRAIL_TRIGGER)
+            try:
+                for n, (mode, trig) in enumerate(combos):
+                    globals().update(NAKED_MODE=mode, NAKED_TRAIL_TRIGGER=trig)
+                    out, _lg, _nt, err = run_dates(days, "BACKTEST", VARIANTS_BACKTEST,
+                                                   expiry_override=exp_bt, finalize=True)
+                    p.progress((n+1)/len(combos), text=f"{mode} / {trig}")
+                    if err or out is None:
+                        continue
+                    T, S, H, O = out
+                    for k, g in S.groupby("strategy"):
+                        rows.append({"naked mode": mode, "trigger": trig,
+                                     "strategy": k,
+                                     "total": round(g.total_pnl.sum(), 2),
+                                     "legs": int(g.num_legs.sum()),
+                                     "naked exits": int(g.reversal_exits.sum())})
+            finally:
+                globals().update(NAKED_MODE=keep[0], NAKED_TRAIL_TRIGGER=keep[1])
+            p.empty()
+            if rows:
+                R = pd.DataFrame(rows)
+                st.markdown(panel("Naked-leg mode comparison",
+                            f"same {len(days)} session(s), same entries — only the "
+                            "naked leg's handling differs"), unsafe_allow_html=True)
+                st.dataframe(R, use_container_width=True, hide_index=True)
+                st.caption("Entries are identical across rows, so any difference is "
+                           "attributable to the naked leg alone.")
+            else:
+                st.info("No trades in that range under any mode.")
 
     if run_bt:
         if not days:
