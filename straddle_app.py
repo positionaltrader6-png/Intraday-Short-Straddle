@@ -99,6 +99,27 @@ TIGHT_SL_MULTIPLIER = 1.25
 #           Pessimistic: assumes no exit was possible until the bar ended.
 # Measured on 11 Sep 2026, the two differed by 4,415 on four SL exits, so this
 # switch matters more than most strategy parameters.
+# ---- naked-leg behaviour, togglable so the variants can be measured ----
+# EMA_TRAIL       stop ratchets down to the 21 EMA, exits when hit
+# EMA_CROSS_EXIT  original: exit when the premium CLOSES above the 21 EMA,
+#                 stop stays at 1.3x
+# FIXED           no trail and no cross exit; keeps the re-based 1.3x stop
+NAKED_MODE = "EMA_TRAIL"
+
+# Which price triggers the trailed stop.
+#   HIGH   any wick touching the level — measured at 2.3x the frequency of a
+#          close cross on real 3-min data, ~20 vs ~9 touches per session
+#   CLOSE  only a completed close beyond the level
+NAKED_TRAIL_TRIGGER = "HIGH"
+
+# Keep the trailed stop this far above the EMA, in percent. 5.0 gives the leg
+# room to breathe without abandoning the trail.
+NAKED_TRAIL_BUFFER_PCT = 0.0
+
+# Re-base the surviving leg's stop to its CURRENT premium x SL_MULTIPLIER at
+# the moment its partner stops out. False keeps 1.3x the original entry.
+NAKED_REBASE_ON_PARTNER_SL = True
+
 SL_FILL_AT_STOP = True
 
 # Premium points added to an at-stop fill, to allow for imperfect execution.
@@ -743,7 +764,12 @@ class StraddleEngine:
             if row.empty:
                 return None
         hi, cl = float(row.high.iloc[0]), float(row.close.iloc[0])
-        if hi < leg.sl:
+        # A naked leg on an EMA trail can be judged on the close instead of the
+        # wick. On real 3-min data the wick touches 2.3x as often, which cuts
+        # the decaying leg far earlier.
+        trigger = cl if (leg.naked and NAKED_MODE == "EMA_TRAIL"
+                         and NAKED_TRAIL_TRIGGER == "CLOSE") else hi
+        if trigger < leg.sl:
             return None
         if SL_FILL_AT_STOP:
             return leg.sl + SL_SLIPPAGE_PTS
@@ -762,14 +788,28 @@ class StraddleEngine:
         h = df[df.ts <= now] if not df.empty else pd.DataFrame()
         if len(h) < EMA_PERIOD + 2:
             return None
+        if NAKED_MODE != "EMA_TRAIL":
+            return None
         ema = float(compute_ema(h.close).iloc[-1])
         if pd.isna(ema) or ema <= 0:
             return None
-        if ema < leg.sl:
+        level = ema * (1.0 + NAKED_TRAIL_BUFFER_PCT / 100.0)
+        if level < leg.sl:
             old = leg.sl
-            leg.sl = ema
+            leg.sl = level
             return old
         return None
+
+    def naked_cross_exit(self, leg, day, now):
+        """Original behaviour: exit when the premium CLOSES above its 21 EMA."""
+        if NAKED_MODE != "EMA_CROSS_EXIT":
+            return False
+        _, df = self.option_df(day, leg.strike, leg.opt_type)
+        h = df[df.ts <= now] if not df.empty else pd.DataFrame()
+        if len(h) < EMA_PERIOD + 2:
+            return False
+        e = compute_ema(h.close)
+        return bool(h.close.iloc[-2] <= e.iloc[-2] and h.close.iloc[-1] > e.iloc[-1])
 
     def exit_leg(self, leg, px, reason, now, idx):
         leg.exit_price = px; leg.exit_time = now
@@ -855,7 +895,8 @@ class StraddleEngine:
                     # no stop at all once the premium has decayed.
                     ltp = self.leg_ltp(day, p, now)
                     old_sl = p.sl
-                    p.sl = ltp * SL_MULTIPLIER
+                    if NAKED_REBASE_ON_PARTNER_SL:
+                        p.sl = ltp * SL_MULTIPLIER
                     self.log.append(f"{self.name}: {p.symbol} now naked · "
                                     f"SL re-based {old_sl:.2f} -> {p.sl:.2f} "
                                     f"(LTP {ltp:.2f} x {SL_MULTIPLIER})")
@@ -872,6 +913,13 @@ class StraddleEngine:
             if leg.naked:
                 if fill is not None:
                     self.exit_leg(leg, fill, "NAKED_SL_HIT", now, i)
+                    continue
+                if self.naked_cross_exit(leg, day, now):
+                    _, df = self.option_df(day, leg.strike, leg.opt_type)
+                    r = df[df.ts == now]
+                    self.exit_leg(leg,
+                                  float(r.close.iloc[0]) if not r.empty else leg.entry_price,
+                                  "NAKED_EMA_CROSS", now, i)
                     continue
 
         if not self.state.open_legs and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
