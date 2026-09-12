@@ -90,6 +90,21 @@ STRIKE_STEP = 50
 SL_MULTIPLIER = 1.3
 TIGHT_SL_MULTIPLIER = 1.25
 
+# How an SL exit is priced.
+#   True  — fill at the stop level. Matches a resting SL-limit or a manual
+#           exit taken at the trigger. Optimistic in one way: it assumes the
+#           limit was always filled, whereas a fast move can jump past it and
+#           leave the leg open with no stop.
+#   False — fill at the candle close when the bar closed beyond the stop.
+#           Pessimistic: assumes no exit was possible until the bar ended.
+# Measured on 11 Sep 2026, the two differed by 4,415 on four SL exits, so this
+# switch matters more than most strategy parameters.
+SL_FILL_AT_STOP = True
+
+# Premium points added to an at-stop fill, to allow for imperfect execution.
+# 0.0 assumes a perfect fill at the trigger.
+SL_SLIPPAGE_PTS = 2.5
+
 EMA_PERIOD = 21
 ADX_PERIOD = 14
 TREND_ADX_PERIOD = 11
@@ -103,11 +118,14 @@ LOXX_PERIOD, LOXX_DEV, LOXX_WIDTH_MULT = 40, 1.0, 0.9
 
 MIN_TREND_BARS = (LOXX_PERIOD - 1) + int(LOXX_PERIOD ** 0.5)            # 45
 FULL_WARMUP_BARS = 2*(LOXX_PERIOD - 1) + int(LOXX_PERIOD ** 0.5) - 1    # 83
-WARMUP_CALENDAR_DAYS = 5
+# 3 calendar days. Measured: beyond two prior sessions ADX converges exactly
+# to its full-history value, so more adds nothing. A Monday after a Friday
+# holiday can still yield zero warm-up — the startup check warns for that.
+WARMUP_CALENDAR_DAYS = 3
 
 ENTRY_START = dt.time(9, 45)
-ENTRY_END = dt.time(14, 30)
-HARD_EXIT = dt.time(15, 10)
+ENTRY_END = dt.time(14, 45)
+HARD_EXIT = dt.time(15, 0)
 
 MAX_STRADDLES_PER_DAY = 2
 TIGHTEN_MODE = "FIRST_STRADDLE_ONLY"   # FIRST_STRADDLE_ONLY | FRESH_TREND | ALWAYS
@@ -150,7 +168,9 @@ STATUS_HEADERS = ["updated_at", "trading_date", "strategy", "status", "straddle_
                   "entry_price", "sl", "ltp", "exit_time", "exit_price",
                   "exit_reason", "leg_pnl", "naked", "sl_tightened", "carry_bars"]
 
-LOG_HEADERS = ["timestamp", "trading_date", "strategy", "spot", "trend",
+# bar_time first: this tab is the record of which bars have been processed,
+# and the engine reads its maximum on restart to know where to resume.
+LOG_HEADERS = ["bar_time", "written_at", "trading_date", "strategy", "spot", "trend",
                "straddles", "open_legs", "closed_legs", "realised_pnl",
                "unrealised_pnl", "total_pnl", "legs_detail"]
 
@@ -218,6 +238,70 @@ def _j(v):
     return v
 
 
+ENGINE_THREAD_NAME = "straddle_engine"
+STALE_HEARTBEAT_MIN = 8      # a heartbeat older than this is treated as dead
+
+
+@st.cache_resource(show_spinner=False)
+def engine_registry():
+    """Process-level singleton holding the running engine.
+
+    st.session_state is per-browser-session, so a reload — or a second tab or
+    device — would lose the handle while the daemon thread kept running, and
+    the Start button would happily launch a second engine writing to the same
+    sheets. A cached_resource is shared by every session in the process.
+    """
+    return {"thread": None, "stop": None, "status": {}, "started_at": None}
+
+
+def live_engine_thread():
+    """Any engine thread alive in this process, registry or not."""
+    for t in threading.enumerate():
+        if t.name == ENGINE_THREAD_NAME and t.is_alive():
+            return t
+    return None
+
+
+def sheet_heartbeat_age_min():
+    """Minutes since Live_Status was last written. Catches an engine running
+    in a *different* container, which the in-process registry cannot see.
+    Returns None if unknown."""
+    try:
+        d = read_tab("LIVE", TAB_STATUS)
+        if d.empty or "updated_at" not in d.columns:
+            return None
+        ts = pd.to_datetime(d["updated_at"], errors="coerce").dropna()
+        if not len(ts):
+            return None
+        return (now_ist() - ts.max().to_pydatetime()).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+SHEET_FONT = "Tahoma"
+
+
+def style_tab(ws, ncols):
+    """Tahoma, centred and middle-aligned. Header row bold on a tinted
+    background. Applied once when a tab is created — ws.clear() wipes values
+    but keeps formatting, so a rewritten tab stays styled."""
+    last = chr(ord("A") + ncols - 1) if ncols <= 26 else "Z"
+    body = {"horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE",
+            "textFormat": {"fontFamily": SHEET_FONT, "fontSize": 10}}
+    head = {"horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE",
+            "backgroundColor": {"red": 0.93, "green": 0.90, "blue": 0.97},
+            "textFormat": {"fontFamily": SHEET_FONT, "fontSize": 10,
+                           "bold": True}}
+    try:
+        ws.format(f"A:{last}", body)
+        ws.format(f"A1:{last}1", head)
+        ws.freeze(rows=1)
+    except Exception:
+        pass          # cosmetic only — never block a write
+
+
 def append_rows(kind, tab, headers, rows):
     if not rows:
         return 0
@@ -227,7 +311,8 @@ def append_rows(kind, tab, headers, rows):
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab, rows=5000, cols=max(len(headers), 12))
-        ws.append_row(headers)
+        ws.append_row([h.upper() for h in headers])
+        style_tab(ws, len(headers))
     ws.append_rows([[_j(v) for v in r] for r in rows], value_input_option="USER_ENTERED")
     return len(rows)
 
@@ -237,13 +322,18 @@ def replace_tab(kind, tab, headers, rows):
     state rather than accumulating history."""
     import gspread
     sh = sheet(kind)
+    created = False
     try:
         ws = sh.worksheet(tab)
         ws.clear()
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab, rows=400, cols=len(headers))
-    ws.update(values=[headers] + [[_j(v) for v in r] for r in rows],
+        created = True
+    ws.update(values=[[h.upper() for h in headers]]
+              + [[_j(v) for v in r] for r in rows],
               value_input_option="USER_ENTERED")
+    if created:
+        style_tab(ws, len(headers))
     return len(rows)
 
 
@@ -273,7 +363,12 @@ def read_tab(kind, tab):
     except gspread.WorksheetNotFound:
         return pd.DataFrame()
     v = ws.get_all_records()
-    return pd.DataFrame(v) if v else pd.DataFrame()
+    if not v:
+        return pd.DataFrame()
+    df = pd.DataFrame(v)
+    # headers are written in caps for display; normalise for code access
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
 
 
 # ============================== MARKET DATA =================================
@@ -648,17 +743,33 @@ class StraddleEngine:
             if row.empty:
                 return None
         hi, cl = float(row.high.iloc[0]), float(row.close.iloc[0])
-        if hi >= leg.sl:
-            return max(leg.sl, cl) if cl >= leg.sl else leg.sl
-        return None
+        if hi < leg.sl:
+            return None
+        if SL_FILL_AT_STOP:
+            return leg.sl + SL_SLIPPAGE_PTS
+        # close-based: if the bar ended beyond the stop, assume no better exit
+        return max(leg.sl, cl) if cl >= leg.sl else leg.sl
 
-    def naked_reversal(self, leg, day, now):
+    def trail_naked_sl(self, leg, day, now):
+        """Ratchet a naked leg's stop down to the 21 EMA of its own premium.
+
+        The leg is short, so the stop sits above price. As the premium decays
+        the EMA falls and drags the stop with it; it never moves back up.
+        This replaces the earlier close-above-EMA exit, which gave back the
+        whole distance between the fixed stop and the EMA.
+        """
         _, df = self.option_df(day, leg.strike, leg.opt_type)
         h = df[df.ts <= now] if not df.empty else pd.DataFrame()
-        if len(h) < EMA_PERIOD+2:
-            return False
-        e = compute_ema(h.close)
-        return bool(h.close.iloc[-2] <= e.iloc[-2] and h.close.iloc[-1] > e.iloc[-1])
+        if len(h) < EMA_PERIOD + 2:
+            return None
+        ema = float(compute_ema(h.close).iloc[-1])
+        if pd.isna(ema) or ema <= 0:
+            return None
+        if ema < leg.sl:
+            old = leg.sl
+            leg.sl = ema
+            return old
+        return None
 
     def exit_leg(self, leg, px, reason, now, idx):
         leg.exit_price = px; leg.exit_time = now
@@ -669,9 +780,8 @@ class StraddleEngine:
         self.log.append(f"{self.name}: exit {leg.symbol} @ {px:.2f} ({reason}) "
                         f"pnl {pnl:+.0f}")
         if self.notify:
-            icon = {"SL_HIT": "🔴", "NAKED_SL_HIT": "🔴",
-                    "REVERSAL_EMA_CROSS": "🟡", "EOD_15_10": "⚪",
-                    "FORCED_DAY_END": "⚪"}.get(reason, "🔵")
+            icon = {"SL_HIT": "🔴", "NAKED_SL_HIT": "🟡",
+                    "EOD_15_00": "⚪", "FORCED_DAY_END": "⚪"}.get(reason, "🔵")
             extra = ""
             if leg.naked:
                 extra += f"  ·  carried naked {leg.carry_bars} bars"
@@ -699,7 +809,7 @@ class StraddleEngine:
                 _, df = self.option_df(day, leg.strike, leg.opt_type)
                 r = df[df.ts <= now]
                 self.exit_leg(leg, float(r.close.iloc[-1]) if not r.empty else leg.entry_price,
-                              "EOD_15_10", now, i)
+                              "EOD_15_00", now, i)
             self.state.done = True
         if self.state.done:
             return
@@ -724,6 +834,15 @@ class StraddleEngine:
                                     f"SL {leg.entry_price*SL_MULTIPLIER:.2f} → "
                                     f"**{leg.sl:.2f}**  (trend {trend})", tag="🟠")
 
+        # Trail naked stops first, so this bar is evaluated against the
+        # updated level rather than the previous one.
+        for leg in self.state.open_legs:
+            if leg.naked:
+                moved = self.trail_naked_sl(leg, day, now)
+                if moved is not None:
+                    self.log.append(f"{self.name}: {leg.symbol} trail SL "
+                                    f"{moved:.2f} -> {leg.sl:.2f} (21 EMA)")
+
         for leg in list(self.state.open_legs):
             fill = self.sl_fill(leg, day, now)
             if fill is not None and not leg.naked:
@@ -731,11 +850,21 @@ class StraddleEngine:
                 p = self.partner(leg)
                 if p:
                     p.naked = True; p.naked_since = i
-                    self.log.append(f"{self.name}: {p.symbol} now naked")
+                    # Re-base the survivor's stop to 1.3x its CURRENT premium.
+                    # Leaving it at 1.3x the original entry would mean almost
+                    # no stop at all once the premium has decayed.
+                    ltp = self.leg_ltp(day, p, now)
+                    old_sl = p.sl
+                    p.sl = ltp * SL_MULTIPLIER
+                    self.log.append(f"{self.name}: {p.symbol} now naked · "
+                                    f"SL re-based {old_sl:.2f} -> {p.sl:.2f} "
+                                    f"(LTP {ltp:.2f} x {SL_MULTIPLIER})")
                     if self.notify:
                         discord(f"**{self.name}** — leg now naked\n"
-                                f"`{now:%H:%M}`  `{p.symbol}`  entry {p.entry_price:.2f}  "
-                                f"SL {p.sl:.2f}", tag="⚠️")
+                                f"`{now:%H:%M}`  `{p.symbol}`  entry {p.entry_price:.2f}\n"
+                                f"SL re-based {old_sl:.2f} → **{p.sl:.2f}** "
+                                f"(LTP {ltp:.2f} × {SL_MULTIPLIER})\n"
+                                f"now trailing the 21 EMA", tag="⚠️")
                 if self.redeploy_mode == REDEPLOY_IMMEDIATE \
                         and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
                     self.deploy(day, spot, fut, now, i)
@@ -743,12 +872,6 @@ class StraddleEngine:
             if leg.naked:
                 if fill is not None:
                     self.exit_leg(leg, fill, "NAKED_SL_HIT", now, i)
-                    continue
-                if self.naked_reversal(leg, day, now):
-                    _, df = self.option_df(day, leg.strike, leg.opt_type)
-                    r = df[df.ts == now]
-                    self.exit_leg(leg, float(r.close.iloc[0]) if not r.empty else leg.entry_price,
-                                  "REVERSAL_EMA_CROSS", now, i)
                     continue
 
         if not self.state.open_legs and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
@@ -806,7 +929,8 @@ class StraddleEngine:
                           f"L{ltp:.1f} SL{l.sl:.1f}" + (" NAKED" if l.naked else ""))
         real = self.state.pnl()
         unreal = self.unrealised(day, now)
-        return [stamp, str(day), self.name, round(spot, 2),
+        return [now.strftime("%Y-%m-%d %H:%M:%S"), stamp, str(day), self.name,
+                round(spot, 2),
                 self._prev_trend or "NONE", self.state.straddle_count,
                 len(self.state.open_legs), len(self.state.closed_legs),
                 round(real, 2), round(unreal, 2), round(real + unreal, 2),
@@ -885,6 +1009,12 @@ class StraddleEngine:
         nums = [l.straddle_num for l in self.state.open_legs + self.state.closed_legs]
         if nums:
             self.state.straddle_count = max(nums)
+
+        # Newest known activity. Used only if Log_<date> is unavailable, to
+        # stop the engine replaying the morning over a resumed position.
+        stamps = [l.entry_time for l in self.state.open_legs + self.state.closed_legs]
+        stamps += [l.exit_time for l in self.state.closed_legs if l.exit_time]
+        self._resume_mark = max(stamps) if stamps else None
         return opened, closed
 
     def run_day(self, day, nifty, vix, fut, finalize=True):
@@ -953,7 +1083,7 @@ def run_dates(dates, run_type, variants, expiry_override=None,
                             len(e.state.closed_legs), e.state.straddle_count,
                             sum(1 for l in e.state.closed_legs if l.naked),
                             sum(1 for l in e.state.closed_legs
-                                if l.exit_reason == "REVERSAL_EMA_CROSS"),
+                                if l.exit_reason == "NAKED_SL_HIT"),
                             e.state.redeploys])
             for l in e.state.open_legs:
                 open_legs.append([e.name, l.straddle_num, l.symbol, l.opt_type,
@@ -1034,13 +1164,38 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             resumed_open += o
             resumed_closed += c
 
+        # Where to resume from. Without this, last_ts stays None and the first
+        # cycle treats every bar since 09:15 as new — replaying the whole
+        # morning against the position we just restored.
+        resume_ts = None
+        try:
+            lg = read_tab("LIVE", tab_log(day))
+            if not lg.empty and "bar_time" in lg.columns:
+                bt = pd.to_datetime(lg["bar_time"], errors="coerce").dropna()
+                if len(bt):
+                    resume_ts = bt.max().to_pydatetime()
+                    note(f"{tab_log(day)}: last bar processed {resume_ts:%H:%M}")
+        except Exception as e:
+            note(f"could not read {tab_log(day)}: {e}")
+
+        if resume_ts is None:
+            marks = [e._resume_mark for e in engines if e._resume_mark]
+            if marks:
+                resume_ts = max(marks)
+                note(f"no log tab — resuming from newest leg activity "
+                     f"{resume_ts:%H:%M}")
+
         msg = f"engine up · expiry {expiry} · {len(engines)} variants"
         if resumed_open or resumed_closed:
             msg += f" · resumed {resumed_open} open / {resumed_closed} closed legs"
+        if resume_ts:
+            msg += f" · continuing after {resume_ts:%H:%M}"
         note(msg)
         if notify_on:
             discord(f"**Straddle Desk started**\n`{day}`  expiry `{expiry}`\n"
                     f"resumed: {resumed_open} open, {resumed_closed} closed\n"
+                    f"continuing after: "
+                    f"{resume_ts.strftime('%H:%M') if resume_ts else 'session start'}\n"
                     f"variants: {', '.join(e.name for e in engines)}", tag="🚀")
     except Exception as e:
         status["state"] = "failed"
@@ -1050,7 +1205,7 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
         return
 
     status["state"] = "running"
-    last_ts = None
+    last_ts = resume_ts        # None only on a genuinely fresh start
 
     while not stop_event.is_set():
         now = now_ist()
@@ -1133,10 +1288,17 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             append_rows("LIVE", tab_log(day), LOG_HEADERS,
                         [e.log_row(day, mark, spot, stamp) for e in engines])
 
-            # Sheet 1 — running ledger: earlier days kept, today refreshed
-            replace_tab("LIVE", TAB_STATUS, STATUS_HEADERS,
-                        carry_rows
-                        + [r for e in engines for r in e.status_rows(day, mark, stamp)])
+            # Sheet 1 — running ledger: earlier days kept, today refreshed.
+            # `updated_at` on these rows doubles as the engine's heartbeat: the
+            # Start button reads it to detect an engine already running in a
+            # different container, which the in-process registry cannot see.
+            today_rows = [r for e in engines for r in e.status_rows(day, mark, stamp)]
+            if not today_rows:
+                # flat and nothing closed yet — still stamp a heartbeat row
+                today_rows = [[stamp, str(day), e.name, "FLAT", 0, "", "", "", 0,
+                               "", "", "", "", "", "", "", 0, False, False, 0]
+                              for e in engines]
+            replace_tab("LIVE", TAB_STATUS, STATUS_HEADERS, carry_rows + today_rows)
 
             status["summary"] = {
                 e.name: dict(realised=round(e.state.pnl(), 2),
@@ -1491,14 +1653,18 @@ if page == "Live run":
     st.markdown(header("Live run", "FIXED_1_3X · DYNAMIC_SL — paper, no orders placed",
                        SESSION_LIVE), unsafe_allow_html=True)
 
-    if "engine_thread" not in st.session_state:
-        st.session_state.engine_thread = None
-        st.session_state.stop_event = threading.Event()
-        st.session_state.engine_status = {}
+    reg = engine_registry()
+    orphan = live_engine_thread()
+    if reg["thread"] is None and orphan is not None:
+        # A thread survived without a registry entry — possible if the cache
+        # was cleared while the daemon kept running. Adopt it rather than
+        # letting the UI offer to start a second one.
+        reg["thread"] = orphan
 
-    running = (st.session_state.engine_thread is not None
-               and st.session_state.engine_thread.is_alive())
-    status = st.session_state.engine_status
+    running = reg["thread"] is not None and reg["thread"].is_alive()
+    if reg["thread"] is not None and not reg["thread"].is_alive():
+        reg["thread"] = None
+    status = reg["status"]
 
     try:
         exps = expiries_for(TODAY)
@@ -1519,23 +1685,33 @@ if page == "Live run":
     with c4:
         st.write("")
         if not running:
-            start = st.button("Start engine", type="primary")
-            if start:
-                st.session_state.stop_event = threading.Event()
-                st.session_state.engine_status = {"state": "starting", "log": []}
-                th = threading.Thread(target=live_engine_loop,
-                                      args=(st.session_state.stop_event, exp_live,
-                                            st.session_state.engine_status, notify_on),
-                                      daemon=True)
-                th.start()
-                st.session_state.engine_thread = th
-                time.sleep(1)
-                st.rerun()
+            if st.button("Start engine", type="primary"):
+                age = sheet_heartbeat_age_min()
+                if age is not None and age < STALE_HEARTBEAT_MIN:
+                    st.error(
+                        f"Live_Status was written {age:.1f} min ago — an engine "
+                        "appears to be running elsewhere (another container, tab "
+                        "or device). Two engines would both trade and both write "
+                        f"to these sheets. Wait {STALE_HEARTBEAT_MIN} min after "
+                        "the last write, or stop the other one first.")
+                else:
+                    reg["stop"] = threading.Event()
+                    reg["status"] = {"state": "starting", "log": []}
+                    reg["started_at"] = now_ist()
+                    th = threading.Thread(target=live_engine_loop,
+                                          args=(reg["stop"], exp_live,
+                                                reg["status"], notify_on),
+                                          daemon=True, name=ENGINE_THREAD_NAME)
+                    th.start()
+                    reg["thread"] = th
+                    time.sleep(1)
+                    st.rerun()
         else:
             if st.button("Stop engine"):
-                st.session_state.stop_event.set()
-                st.session_state.engine_thread.join(timeout=5)
-                st.session_state.engine_thread = None
+                if reg["stop"] is not None:
+                    reg["stop"].set()
+                reg["thread"].join(timeout=8)
+                reg["thread"] = None
                 st.rerun()
 
     state = status.get("state", "idle")
@@ -1581,6 +1757,11 @@ if page == "Live run":
                         f"Sheet 1 · updated {ST.updated_at.iloc[-1]}"),
                         unsafe_allow_html=True)
             st.dataframe(ST, use_container_width=True, hide_index=True, height=320)
+
+    if running and reg.get("started_at"):
+        st.caption(f"Engine started {reg['started_at']:%H:%M} IST · "
+                   f"thread `{ENGINE_THREAD_NAME}` · shared across all tabs "
+                   "and devices.")
 
     lg = status.get("log")
     if lg:
