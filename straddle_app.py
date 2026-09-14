@@ -116,6 +116,16 @@ NAKED_TRAIL_TRIGGER = "HIGH"
 # room to breathe without abandoning the trail.
 NAKED_TRAIL_BUFFER_PCT = 0.0
 
+# Stepped profit lock on a naked leg. Every NAKED_STEP_PCT of decay from its
+# entry premium, the stop is cut by NAKED_STEP_SL_PCT of its re-based level.
+# Entry 105, stop 136.50: at 30% decay (premium 73.5) the stop becomes 95.55,
+# turning a -2,362 risk into a +709 lock. Ratchets down only.
+# Applies to every variant, including the ones with no trail.
+NAKED_STEP_ENABLED = True
+NAKED_STEP_PCT = 30.0          # decay per step
+NAKED_STEP_SL_PCT = 30.0       # stop cut per step
+NAKED_STEP_MIN_SL = 1.0        # floor, so the stop can never reach zero
+
 # Re-base the surviving leg's stop to its CURRENT premium x SL_MULTIPLIER at
 # the moment its partner stops out. False keeps 1.3x the original entry.
 NAKED_REBASE_ON_PARTNER_SL = True
@@ -160,12 +170,29 @@ REDEPLOY_CUTOFF = dt.time(14, 45)
 # forward basis can push one strike away from a simple spot rounding.
 STRIKE_SCAN = 1
 
-# name,          dynamic_sl, redeploy_mode,      max_open_legs
-FIXED   = ("FIXED_1_3X", False, REDEPLOY_IMMEDIATE, 3)
-DYNAMIC = ("DYNAMIC_SL", True,  REDEPLOY_IMMEDIATE, 3)
+# Supertrend on the OPTION PREMIUM, used as a naked-leg trailing stop.
+# ATR-based, so it sits further from price than the 21 EMA — which matters,
+# because a stop trailing too tightly cuts the decaying leg early.
+ST_PERIOD = 10
+ST_MULT = 2.0
 
-VARIANTS_LIVE = [FIXED, DYNAMIC]
-VARIANTS_BACKTEST = [FIXED, DYNAMIC]
+# Each variant is one naked-leg rule. Entries, strike selection and the 1.3x
+# initial stop are identical across all of them, so any difference in results
+# is attributable to the naked leg alone.
+#
+#   FIXED           re-based 1.3x stop only; holds to the stop or 15:00
+#   EMA_CROSS_EXIT  1.3x stop, plus exit when the premium CLOSES above EMA(21)
+#   ST_TRAIL        stop ratchets down to the Supertrend line on the premium
+#   EMA_TRAIL       stop ratchets down to EMA(21) — kept for comparison
+#
+# name,            dynamic_sl, redeploy_mode,      max_legs, naked_mode
+SL_FIXED  = ("SL_1_3X",       False, REDEPLOY_IMMEDIATE, 3, "FIXED")
+SL_EMA    = ("SL_EMA21",      False, REDEPLOY_IMMEDIATE, 3, "EMA_CROSS_EXIT")
+SL_ST     = ("SL_SUPERTREND", False, REDEPLOY_IMMEDIATE, 3, "ST_TRAIL")
+SL_EMATRL = ("SL_EMA_TRAIL",  False, REDEPLOY_IMMEDIATE, 3, "EMA_TRAIL")
+
+VARIANTS_LIVE = [SL_FIXED, SL_EMA, SL_ST]
+VARIANTS_BACKTEST = [SL_FIXED, SL_EMA, SL_ST, SL_EMATRL]
 
 # ---- SHEET LAYOUT -------------------------------------------------------
 # Sheet 1  constant name. The full leg ledger for the current day, rewritten
@@ -541,6 +568,24 @@ def compute_loxx_hlhvb(df, period=LOXX_PERIOD, dev=LOXX_DEV):
     return me+d*dev, me, me-d*dev
 
 
+def compute_supertrend(df, period=ST_PERIOD, mult=ST_MULT):
+    """Supertrend on an option premium series. Returns (line, direction).
+    direction +1 = price above the line, -1 = below."""
+    hl2 = (df.high + df.low) / 2.0
+    atr = true_range(df).ewm(alpha=1/period, adjust=False).mean()
+    ub, lb = hl2 + mult*atr, hl2 - mult*atr
+    n = len(df)
+    U = np.full(n, np.nan); L = np.full(n, np.nan); D = np.ones(n, dtype=int)
+    c = df.close.to_numpy()
+    for i in range(n):
+        if i == 0 or np.isnan(ub.iloc[i]):
+            U[i], L[i] = ub.iloc[i], lb.iloc[i]; continue
+        U[i] = ub.iloc[i] if (ub.iloc[i] < U[i-1] or c[i-1] > U[i-1]) else U[i-1]
+        L[i] = lb.iloc[i] if (lb.iloc[i] > L[i-1] or c[i-1] < L[i-1]) else L[i-1]
+        D[i] = 1 if c[i] > U[i-1] else (-1 if c[i] < L[i-1] else D[i-1])
+    return pd.Series(np.where(D == 1, L, U), index=df.index), pd.Series(D, index=df.index)
+
+
 def _rising(s):
     return bool(s.iloc[-1] > s.iloc[-2]) if len(s) > 1 and s.iloc[-2:].notna().all() else False
 
@@ -564,6 +609,8 @@ class Leg:
     naked: bool = False
     naked_since: int = None
     sl_tightened: bool = False
+    base_sl: float = None          # stop the stepped profit lock scales from
+    steps_locked: int = 0
     exit_price: float = None
     exit_time: dt.datetime = None
     exit_reason: str = None
@@ -592,11 +639,13 @@ class DayState:
 # ============================== ENGINE ======================================
 class StraddleEngine:
     def __init__(self, name, dynamic_sl, redeploy_mode, max_open_legs,
-                 smart, lookup, expiry, option_cache):
+                 smart, lookup, expiry, option_cache, naked_mode=None):
         self.name = name
         self.dynamic_sl = dynamic_sl
         self.redeploy_mode = redeploy_mode
         self.max_open_legs = max_open_legs
+        # per-engine, so several naked rules can run side by side on one feed
+        self.naked_mode = naked_mode or NAKED_MODE
         self.smart = smart
         self.lookup = lookup
         self.expiry = expiry
@@ -767,7 +816,8 @@ class StraddleEngine:
         # A naked leg on an EMA trail can be judged on the close instead of the
         # wick. On real 3-min data the wick touches 2.3x as often, which cuts
         # the decaying leg far earlier.
-        trigger = cl if (leg.naked and NAKED_MODE == "EMA_TRAIL"
+        trailing = self.naked_mode in ("EMA_TRAIL", "ST_TRAIL")
+        trigger = cl if (leg.naked and trailing
                          and NAKED_TRAIL_TRIGGER == "CLOSE") else hi
         if trigger < leg.sl:
             return None
@@ -775,6 +825,30 @@ class StraddleEngine:
             return leg.sl + SL_SLIPPAGE_PTS
         # close-based: if the bar ended beyond the stop, assume no better exit
         return max(leg.sl, cl) if cl >= leg.sl else leg.sl
+
+    def step_naked_sl(self, leg, day, now):
+        """Ratchet the stop down one notch per NAKED_STEP_PCT of decay.
+
+        Independent of the trail modes — a FIXED leg still locks profit as the
+        premium falls, without the early cuts a tight trail causes.
+        """
+        if not NAKED_STEP_ENABLED or leg.entry_price <= 0:
+            return None
+        base = leg.base_sl if leg.base_sl else leg.sl
+        ltp = self.leg_ltp(day, leg, now)
+        decay = (leg.entry_price - ltp) / leg.entry_price
+        steps = int(decay // (NAKED_STEP_PCT / 100.0))
+        if steps <= leg.steps_locked or steps <= 0:
+            return None
+        target = base * (1.0 - (NAKED_STEP_SL_PCT / 100.0) * steps)
+        target = max(target, NAKED_STEP_MIN_SL)
+        if target >= leg.sl:
+            leg.steps_locked = steps        # already tighter; just record it
+            return None
+        old = leg.sl
+        leg.sl = target
+        leg.steps_locked = steps
+        return old
 
     def trail_naked_sl(self, leg, day, now):
         """Ratchet a naked leg's stop down to the 21 EMA of its own premium.
@@ -788,12 +862,16 @@ class StraddleEngine:
         h = df[df.ts <= now] if not df.empty else pd.DataFrame()
         if len(h) < EMA_PERIOD + 2:
             return None
-        if NAKED_MODE != "EMA_TRAIL":
+        if self.naked_mode == "EMA_TRAIL":
+            base = float(compute_ema(h.close).iloc[-1])
+        elif self.naked_mode == "ST_TRAIL":
+            line, _d = compute_supertrend(h)
+            base = float(line.iloc[-1])
+        else:
             return None
-        ema = float(compute_ema(h.close).iloc[-1])
-        if pd.isna(ema) or ema <= 0:
+        if pd.isna(base) or base <= 0:
             return None
-        level = ema * (1.0 + NAKED_TRAIL_BUFFER_PCT / 100.0)
+        level = base * (1.0 + NAKED_TRAIL_BUFFER_PCT / 100.0)
         if level < leg.sl:
             old = leg.sl
             leg.sl = level
@@ -802,7 +880,7 @@ class StraddleEngine:
 
     def naked_cross_exit(self, leg, day, now):
         """Original behaviour: exit when the premium CLOSES above its 21 EMA."""
-        if NAKED_MODE != "EMA_CROSS_EXIT":
+        if self.naked_mode != "EMA_CROSS_EXIT":
             return False
         _, df = self.option_df(day, leg.strike, leg.opt_type)
         h = df[df.ts <= now] if not df.empty else pd.DataFrame()
@@ -878,10 +956,22 @@ class StraddleEngine:
         # updated level rather than the previous one.
         for leg in self.state.open_legs:
             if leg.naked:
+                stepped = self.step_naked_sl(leg, day, now)
+                if stepped is not None:
+                    self.log.append(f"{self.name}: {leg.symbol} step-lock "
+                                    f"{stepped:.2f} -> {leg.sl:.2f} "
+                                    f"({leg.steps_locked} x {NAKED_STEP_PCT:g}% decay)")
+                    if self.notify:
+                        discord(f"**{self.name}** — profit lock\n"
+                                f"`{now:%H:%M}`  `{leg.symbol}`\n"
+                                f"SL {stepped:.2f} → **{leg.sl:.2f}**  "
+                                f"({leg.steps_locked} × {NAKED_STEP_PCT:g}% decay)",
+                                tag="🔒")
                 moved = self.trail_naked_sl(leg, day, now)
                 if moved is not None:
+                    src = "Supertrend" if self.naked_mode == "ST_TRAIL" else "21 EMA"
                     self.log.append(f"{self.name}: {leg.symbol} trail SL "
-                                    f"{moved:.2f} -> {leg.sl:.2f} (21 EMA)")
+                                    f"{moved:.2f} -> {leg.sl:.2f} ({src})")
 
         for leg in list(self.state.open_legs):
             fill = self.sl_fill(leg, day, now)
@@ -897,6 +987,7 @@ class StraddleEngine:
                     old_sl = p.sl
                     if NAKED_REBASE_ON_PARTNER_SL:
                         p.sl = ltp * SL_MULTIPLIER
+                    p.base_sl = p.sl
                     self.log.append(f"{self.name}: {p.symbol} now naked · "
                                     f"SL re-based {old_sl:.2f} -> {p.sl:.2f} "
                                     f"(LTP {ltp:.2f} x {SL_MULTIPLIER})")
@@ -1122,8 +1213,9 @@ def run_dates(dates, run_type, variants, expiry_override=None,
     cache = {}
     for n, day in enumerate(sorted(dates)):
         expiry = expiry_override or nearest_expiry(expiries, day)
-        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
-                   for nm, dyn, rd, ml in variants]
+        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache,
+                                  naked_mode=nk)
+                   for nm, dyn, rd, ml, nk in variants]
         for e in engines:
             e.run_day(day, nifty, vix, fut, finalize=finalize)
             trades += e.new_trade_rows(day)
@@ -1184,8 +1276,9 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
         smart = angel_login()
         lookup, _ = option_universe()
         cache = {}
-        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache)
-                   for nm, dyn, rd, ml in VARIANTS_LIVE]
+        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache,
+                                  naked_mode=nk)
+                   for nm, dyn, rd, ml, nk in VARIANTS_LIVE]
 
         try:
             prev = read_tab("LIVE", TAB_STATUS)
@@ -1536,7 +1629,8 @@ div[data-baseweb="select"]>div, div[data-testid="stDateInput"] input {
 </style>
 """
 
-GRADS = {"FIXED_1_3X": "g1", "DYNAMIC_SL": "g2"}
+GRADS = {"SL_1_3X": "g1", "SL_EMA21": "g2", "SL_SUPERTREND": "g3",
+         "SL_EMA_TRAIL": "g4"}
 
 
 def kpi(label, value, footnote="", grad="g1"):
@@ -1596,7 +1690,7 @@ def equity_chart(S):
                             axis=alt.Axis(gridColor="#f4e9f0", labelColor="#9b8aa6")),
                     color=alt.Color("strategy:N", title=None,
                                     scale=alt.Scale(domain=list(GRADS),
-                                                    range=["#ec4899", "#8b5cf6"]),
+                                                    range=["#ec4899", "#8b5cf6", "#0ea5e9", "#f59e0b"]),
                                     legend=alt.Legend(orient="top")),
                     tooltip=["trading_date:T", "strategy:N", "cum:Q", "total_pnl:Q"])
             .properties(height=260).configure_view(strokeWidth=0))
@@ -1673,31 +1767,40 @@ with st.sidebar:
                                 SL_SLIPPAGE_PTS, 0.5, disabled=_engine_live)
 
         st.markdown("**Naked leg**")
-        _nm = st.selectbox(
-            "Behaviour", ["EMA_TRAIL", "EMA_CROSS_EXIT", "FIXED"],
-            index=["EMA_TRAIL", "EMA_CROSS_EXIT", "FIXED"].index(NAKED_MODE),
-            disabled=_engine_live,
-            help="EMA_TRAIL: stop ratchets down to the 21 EMA.  "
-                 "EMA_CROSS_EXIT: exit on a close above the 21 EMA, stop stays put.  "
-                 "FIXED: no trail and no cross exit.")
+        st.caption("Each variant runs its own rule — these apply to the trailing "
+                   "variants only.")
         _nt = st.selectbox(
             "Trail trigger", ["HIGH", "CLOSE"],
             index=["HIGH", "CLOSE"].index(NAKED_TRAIL_TRIGGER),
-            disabled=_engine_live or _nm != "EMA_TRAIL",
+            disabled=_engine_live,
             help="HIGH fires on any wick — 2.3x as often as a close on real "
                  "3-min data (~20 vs ~9 per session).")
-        _nb = st.slider("Trail buffer above the EMA (%)", 0.0, 20.0,
-                        NAKED_TRAIL_BUFFER_PCT, 1.0,
-                        disabled=_engine_live or _nm != "EMA_TRAIL")
+        _nb = st.slider("Trail buffer above the line (%)", 0.0, 20.0,
+                        NAKED_TRAIL_BUFFER_PCT, 1.0, disabled=_engine_live)
+        _lock = st.checkbox("Stepped profit lock", NAKED_STEP_ENABLED,
+                            disabled=_engine_live,
+                            help="Every N% of decay, cut the stop by N%. "
+                                 "Applies to every variant, trail or not.")
+        _lstep = st.slider("Decay per step (%)", 10.0, 50.0, NAKED_STEP_PCT, 5.0,
+                           disabled=_engine_live or not _lock)
+        _lcut = st.slider("Stop cut per step (%)", 10.0, 50.0, NAKED_STEP_SL_PCT, 5.0,
+                          disabled=_engine_live or not _lock)
+        _stp = st.slider("Supertrend period", 5, 20, ST_PERIOD, 1,
+                         disabled=_engine_live)
+        _stm = st.slider("Supertrend multiplier", 1.0, 4.0, ST_MULT, 0.5,
+                         disabled=_engine_live)
+        _nm = NAKED_MODE
         _nr = st.checkbox("Re-base stop to LTP x base SL when the partner stops out",
                           NAKED_REBASE_ON_PARTNER_SL, disabled=_engine_live)
 
     if not _engine_live:
         globals().update(SL_MULTIPLIER=_slm, TIGHT_SL_MULTIPLIER=_tsm,
                          SL_FILL_AT_STOP=_fas, SL_SLIPPAGE_PTS=_slip,
-                         NAKED_MODE=_nm, NAKED_TRAIL_TRIGGER=_nt,
-                         NAKED_TRAIL_BUFFER_PCT=_nb,
-                         NAKED_REBASE_ON_PARTNER_SL=_nr)
+                         NAKED_TRAIL_TRIGGER=_nt, NAKED_TRAIL_BUFFER_PCT=_nb,
+                         NAKED_REBASE_ON_PARTNER_SL=_nr,
+                         ST_PERIOD=int(_stp), ST_MULT=float(_stm),
+                         NAKED_STEP_ENABLED=_lock, NAKED_STEP_PCT=float(_lstep),
+                         NAKED_STEP_SL_PCT=float(_lcut))
 
     st.markdown(
         f'<div class="side-kv"><span>Naked</span><b>{NAKED_MODE.replace("_"," ").title()}'
@@ -1904,53 +2007,14 @@ elif page == "Backtest":
                                             format_func=lambda d: f"{d:%d %b %Y}",
                                             key="exp_bt")
     save = c6.checkbox("Save to sheet", value=False)
-    st.caption(f"{len(days)} weekday(s) selected · rules: naked "
-               f"**{NAKED_MODE}** / trigger **{NAKED_TRAIL_TRIGGER}** · SL fill "
+    st.caption(f"{len(days)} weekday(s) selected · "
+               f"{len(VARIANTS_BACKTEST)} naked-leg rules · "
+               f"trigger **{NAKED_TRAIL_TRIGGER}** · SL fill "
                f"**{'at stop' if SL_FILL_AT_STOP else 'at close'}"
                f"{f' +{SL_SLIPPAGE_PTS:g}' if SL_FILL_AT_STOP else ''}** · "
                f"base **{SL_MULTIPLIER:g}x** — change these in the sidebar")
 
-    b1, b2 = st.columns([1, 1])
-    run_bt = b1.button("Run backtest", type="primary")
-    sweep = b2.button("Compare naked modes")
-
-    if sweep:
-        if not days:
-            st.warning("No weekdays selected.")
-        else:
-            rows = []
-            p = st.progress(0.0, text="sweeping")
-            combos = [("EMA_TRAIL", "HIGH"), ("EMA_TRAIL", "CLOSE"),
-                      ("EMA_CROSS_EXIT", "HIGH"), ("FIXED", "HIGH")]
-            keep = (NAKED_MODE, NAKED_TRAIL_TRIGGER)
-            try:
-                for n, (mode, trig) in enumerate(combos):
-                    globals().update(NAKED_MODE=mode, NAKED_TRAIL_TRIGGER=trig)
-                    out, _lg, _nt, err = run_dates(days, "BACKTEST", VARIANTS_BACKTEST,
-                                                   expiry_override=exp_bt, finalize=True)
-                    p.progress((n+1)/len(combos), text=f"{mode} / {trig}")
-                    if err or out is None:
-                        continue
-                    T, S, H, O = out
-                    for k, g in S.groupby("strategy"):
-                        rows.append({"naked mode": mode, "trigger": trig,
-                                     "strategy": k,
-                                     "total": round(g.total_pnl.sum(), 2),
-                                     "legs": int(g.num_legs.sum()),
-                                     "naked exits": int(g.reversal_exits.sum())})
-            finally:
-                globals().update(NAKED_MODE=keep[0], NAKED_TRAIL_TRIGGER=keep[1])
-            p.empty()
-            if rows:
-                R = pd.DataFrame(rows)
-                st.markdown(panel("Naked-leg mode comparison",
-                            f"same {len(days)} session(s), same entries — only the "
-                            "naked leg's handling differs"), unsafe_allow_html=True)
-                st.dataframe(R, use_container_width=True, hide_index=True)
-                st.caption("Entries are identical across rows, so any difference is "
-                           "attributable to the naked leg alone.")
-            else:
-                st.info("No trades in that range under any mode.")
+    run_bt = st.button("Run backtest", type="primary")
 
     if run_bt:
         if not days:
