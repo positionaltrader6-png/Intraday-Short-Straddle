@@ -1580,17 +1580,21 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checke
 .panel .sub { font-size:.79rem; color:#8b7d9c; margin-top:.2rem; font-weight:500; }
 
 /* ---------- kpi ---------- */
-.kpi { border-radius:20px; padding:1.2rem 1.3rem; color:#fff; position:relative;
-  overflow:hidden; box-shadow:0 10px 28px rgba(90,25,120,.22);
-  transition:transform .18s ease; }
+.kpi { border-radius:18px; padding:.95rem 1rem; color:#fff; position:relative;
+  overflow:hidden; box-shadow:0 8px 22px rgba(90,25,120,.20);
+  transition:transform .18s ease; min-width:0; }
 .kpi:hover { transform:translateY(-3px); }
-.kpi:after { content:""; position:absolute; right:-28px; top:-28px; width:110px;
-  height:110px; border-radius:50%; background:rgba(255,255,255,.13); }
-.kpi .lbl { font-size:.7rem; text-transform:uppercase; letter-spacing:.09em;
-  font-weight:700; opacity:.92; }
-.kpi .val { font-size:1.95rem; font-weight:800; letter-spacing:-.03em;
-  line-height:1.15; margin-top:.35rem; }
-.kpi .fin { font-size:.75rem; opacity:.88; margin-top:.25rem; font-weight:500; }
+.kpi:after { content:""; position:absolute; right:-30px; top:-30px; width:88px;
+  height:88px; border-radius:50%; background:rgba(255,255,255,.12); }
+.kpi .lbl { font-size:.62rem; text-transform:uppercase; letter-spacing:.05em;
+  font-weight:700; opacity:.92; white-space:nowrap; overflow:hidden;
+  text-overflow:ellipsis; }
+/* clamp so five cards on a tablet never wrap the figure onto two lines */
+.kpi .val { font-size:clamp(1.05rem, 1.9vw, 1.7rem); font-weight:800;
+  letter-spacing:-.03em; line-height:1.2; margin-top:.3rem;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.kpi .fin { font-size:.68rem; opacity:.88; margin-top:.2rem; font-weight:500;
+  white-space:nowrap; }
 .g1 { background:linear-gradient(135deg,#f43f5e,#ec4899 55%,#d946ef); }
 .g2 { background:linear-gradient(135deg,#8b5cf6,#6366f1 60%,#4f46e5); }
 .g3 { background:linear-gradient(135deg,#06b6d4,#0ea5e9 60%,#3b82f6); }
@@ -1846,7 +1850,8 @@ def render_kpis(S, variants, note=""):
         grad = ("gmute" if not has else
                 (GRADS.get(v[0], "g1") if pnl >= 0 else "gneg"))
         with c:
-            st.markdown(kpi(v[0].replace("_", " "), money(pnl) if has else "--",
+            label = v[0].replace("SL_", "").replace("_", " ")
+            st.markdown(kpi(label, money(pnl) if has else "--",
                             f"{legs} legs" if has else "no data", grad),
                         unsafe_allow_html=True)
     with cols[-1]:
@@ -1938,9 +1943,9 @@ if page == "Live run":
                                for k, v in summ.items()])
         render_kpis(S_live, VARIANTS_LIVE, TODAY.strftime("%d %b"))
         det = pd.DataFrame([{"strategy": k, **v} for k, v in summ.items()])
-        st.markdown(panel("Current state", f"as of {status.get('last_bar','--')}"),
-                    unsafe_allow_html=True)
-        st.dataframe(det, use_container_width=True, hide_index=True)
+        with st.expander(f"Current state · as of {status.get('last_bar','--')}",
+                         expanded=False):
+            st.dataframe(det, use_container_width=True, hide_index=True)
     else:
         try:
             ST = read_tab("LIVE", TAB_STATUS)
@@ -1960,10 +1965,10 @@ if page == "Live run":
             agg["trading_date"] = ST.trading_date.iloc[0] if len(ST) else str(TODAY)
             render_kpis(agg, VARIANTS_LIVE,
                         f"{ST.trading_date.iloc[0]}" if len(ST) else "")
-            st.markdown(panel("Leg ledger",
-                        f"Sheet 1 · updated {ST.updated_at.iloc[-1]}"),
-                        unsafe_allow_html=True)
-            st.dataframe(ST, use_container_width=True, hide_index=True, height=320)
+            with st.expander(f"Leg ledger · updated {ST.updated_at.iloc[-1]}",
+                             expanded=False):
+                st.dataframe(ST, use_container_width=True, hide_index=True,
+                             height=320)
 
     if running and reg.get("started_at"):
         st.caption(f"Engine started {reg['started_at']:%H:%M} IST · "
@@ -1972,8 +1977,8 @@ if page == "Live run":
 
     lg = status.get("log")
     if lg:
-        st.markdown(panel("Engine log", "newest last"), unsafe_allow_html=True)
-        st.code("\n".join(lg[-25:]))
+        with st.expander(f"Engine log · {len(lg)} lines", expanded=False):
+            st.code("\n".join(lg[-40:]))
     if running:
         if st.button("Refresh view"):
             st.rerun()
@@ -2049,9 +2054,10 @@ elif page == "Backtest":
                             if rc is not None:
                                 st.markdown(panel("Exit reasons"), unsafe_allow_html=True)
                                 st.altair_chart(rc, use_container_width=True)
-                        st.markdown(panel("Per-session summary"), unsafe_allow_html=True)
-                        st.dataframe(S.drop(columns=["run_type"], errors="ignore"),
-                                     use_container_width=True, hide_index=True)
+                        with st.expander(f"Per-session summary · {len(S)} rows",
+                                         expanded=False):
+                            st.dataframe(S.drop(columns=["run_type"], errors="ignore"),
+                                         use_container_width=True, hide_index=True)
                         e1, e2 = st.columns(2)
                         e1.download_button("Download trades", T.to_csv(index=False),
                                            "straddle_trades.csv", "text/csv")
@@ -2072,8 +2078,6 @@ elif page == "Backtest":
                                     append_rows("BACKTEST", f"Heartbeat_{_d}",
                                                 HEARTBEAT_HEADERS, _g.values.tolist())
                             st.success("Written to the backtest sheet.")
-                    with st.expander("Engine log"):
-                        st.code("\n".join(logs) or "(nothing)")
             except Exception as e:
                 p.empty(); st.error(f"{type(e).__name__}: {e}")
     else:
@@ -2118,8 +2122,9 @@ else:
                     st.markdown(panel("Cumulative P&L",
                                 f"{len(tabs)} day tab(s)"), unsafe_allow_html=True)
                     st.altair_chart(ch, use_container_width=True)
-                st.markdown(panel("Per-leg trades"), unsafe_allow_html=True)
-                st.dataframe(A.tail(200), use_container_width=True, hide_index=True)
+                with st.expander(f"Per-leg trades · {len(A)} rows", expanded=False):
+                    st.dataframe(A.tail(200), use_container_width=True,
+                                 hide_index=True)
                 st.download_button("Download all trades", A.to_csv(index=False),
                                    f"{kind.lower()}_trades.csv", "text/csv")
     else:
