@@ -1580,17 +1580,22 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checke
 .panel .sub { font-size:.79rem; color:#8b7d9c; margin-top:.2rem; font-weight:500; }
 
 /* ---------- kpi ---------- */
-.kpi { border-radius:18px; padding:.95rem 1rem; color:#fff; position:relative;
+.kpi-grid { display:grid; gap:.85rem; margin-bottom:1.1rem;
+  grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); }
+@media (max-width:900px) {
+  .kpi-grid { grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); }
+}
+.kpi { border-radius:18px; padding:1.05rem 1.15rem; color:#fff; position:relative;
   overflow:hidden; box-shadow:0 8px 22px rgba(90,25,120,.20);
   transition:transform .18s ease; min-width:0; }
 .kpi:hover { transform:translateY(-3px); }
 .kpi:after { content:""; position:absolute; right:-30px; top:-30px; width:88px;
   height:88px; border-radius:50%; background:rgba(255,255,255,.12); }
-.kpi .lbl { font-size:.62rem; text-transform:uppercase; letter-spacing:.05em;
+.kpi .lbl { font-size:.66rem; text-transform:uppercase; letter-spacing:.06em;
   font-weight:700; opacity:.92; white-space:nowrap; overflow:hidden;
   text-overflow:ellipsis; }
 /* clamp so five cards on a tablet never wrap the figure onto two lines */
-.kpi .val { font-size:clamp(1.05rem, 1.9vw, 1.7rem); font-weight:800;
+.kpi .val { font-size:clamp(1.25rem, 2.1vw, 1.8rem); font-weight:800;
   letter-spacing:-.03em; line-height:1.2; margin-top:.3rem;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .kpi .fin { font-size:.68rem; opacity:.88; margin-top:.2rem; font-weight:500;
@@ -1841,23 +1846,24 @@ with st.sidebar:
 
 
 def render_kpis(S, variants, note=""):
-    cols = st.columns(len(variants) + 1)
-    for c, v in zip(cols, variants):
+    """One CSS grid rather than st.columns — five fixed columns on a tablet
+    squeezed the figures; a grid wraps to a second row instead."""
+    cards = []
+    for v in variants:
         g = S[S.strategy == v[0]] if not S.empty else S
         has = not g.empty
         pnl = pd.to_numeric(g.total_pnl, errors="coerce").sum() if has else 0
         legs = int(pd.to_numeric(g.num_legs, errors="coerce").sum()) if has else 0
         grad = ("gmute" if not has else
                 (GRADS.get(v[0], "g1") if pnl >= 0 else "gneg"))
-        with c:
-            label = v[0].replace("SL_", "").replace("_", " ")
-            st.markdown(kpi(label, money(pnl) if has else "--",
-                            f"{legs} legs" if has else "no data", grad),
-                        unsafe_allow_html=True)
-    with cols[-1]:
-        n = S.trading_date.nunique() if not S.empty else 0
-        st.markdown(kpi("Sessions", str(n), note or "recorded",
-                        "g4" if n else "gmute"), unsafe_allow_html=True)
+        label = v[0].replace("SL_", "").replace("_", " ")
+        cards.append(kpi(label, money(pnl) if has else "--",
+                         f"{legs} legs" if has else "no data", grad))
+    n = S.trading_date.nunique() if not S.empty else 0
+    cards.append(kpi("Sessions", str(n), note or "recorded",
+                     "g4" if n else "gmute"))
+    st.markdown('<div class="kpi-grid">' + "".join(cards) + "</div>",
+                unsafe_allow_html=True)
 
 
 # ================================ LIVE ======================================
