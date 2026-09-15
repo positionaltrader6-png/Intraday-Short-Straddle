@@ -27,24 +27,43 @@ produces exactly the trades a 3-minute poller would have produced. Press
 
 SETUP
 -----
-repo: straddle_app.py, requirements.txt
-      (streamlit, smartapi-python, pyotp, gspread, google-auth, pandas, numpy, requests)
+Repo contains exactly two files. No credentials, ever.
 
-Streamlit -> Settings -> Secrets:
+    straddle_app.py
+    requirements.txt
+
+Streamlit -> Settings -> Secrets (stored outside the repo):
 
     [angel]
-    api_key = "..."
-    client_code = "..."
-    password = "..."
-    totp_secret = "..."
+    api_key      = "<angel api key>"
+    client_code  = "<client code>"
+    password     = "<login pin>"
+    totp_secret  = "<totp seed>"
 
     [sheets]
-    sheet_id = "..."
+    live_sheet_id     = "<spreadsheet id for live results>"
+    backtest_sheet_id = "<spreadsheet id for backtest results>"
 
-    [gcp_service_account]
-    ... contents of service_account.json as TOML ...
+    [discord]                       # optional; alerts are skipped without it
+    webhook = "<discord webhook url>"
 
-Never put credentials in the repo.
+    [gcp_service_account]           # service_account.json, converted to TOML
+    type         = "service_account"
+    project_id   = "..."
+    private_key  = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+    client_email = "...@....iam.gserviceaccount.com"
+    token_uri    = "https://oauth2.googleapis.com/token"
+
+Share BOTH spreadsheets with the service account's client_email as Editor.
+
+Add a .gitignore containing at least:
+
+    service_account.json
+    .streamlit/secrets.toml
+    *.csv
+
+Every secret is read through st.secrets at the point of use — nothing in this
+file is a literal credential.
 """
 
 import datetime as dt
@@ -658,6 +677,10 @@ class StraddleEngine:
         self.notify = False          # only the live engine turns this on
         self._logged = set()
         self.last_ts = None
+        # newest known leg activity, used as a resume point when the log tab
+        # is unavailable. Must exist before resume_from runs, since that method
+        # returns early when there is nothing to restore.
+        self._resume_mark = None
 
     # ---- data ----
     def option_df(self, day, strike, ot):
@@ -1026,6 +1049,7 @@ class StraddleEngine:
         self._prev_trend = None
         self._logged = set()
         self.last_ts = None
+        self._resume_mark = None
 
     def leg_ltp(self, day, leg, now):
         _, df = self.option_df(day, leg.strike, leg.opt_type)
@@ -1320,7 +1344,8 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             note(f"could not read {tab_log(day)}: {e}")
 
         if resume_ts is None:
-            marks = [e._resume_mark for e in engines if e._resume_mark]
+            marks = [m_ for m_ in (getattr(e, "_resume_mark", None) for e in engines)
+                     if m_]
             if marks:
                 resume_ts = max(marks)
                 note(f"no log tab — resuming from newest leg activity "
