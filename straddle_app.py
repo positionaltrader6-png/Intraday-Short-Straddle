@@ -239,7 +239,10 @@ STATUS_HEADERS = ["updated_at", "trading_date", "strategy", "status", "straddle_
 # and the engine reads its maximum on restart to know where to resume.
 LOG_HEADERS = ["bar_time", "written_at", "trading_date", "strategy", "spot", "trend",
                "straddles", "open_legs", "closed_legs", "realised_pnl",
-               "unrealised_pnl", "total_pnl", "legs_detail"]
+               "unrealised_pnl", "total_pnl", "legs_detail",
+               # entry-condition inputs, so a rejected bar can be explained
+               "adx", "adxr", "adx_falling", "adxr_falling", "vix",
+               "entry_ok", "entry_why"]
 
 TRADE_HEADERS = ["trading_date", "strategy", "straddle_num", "leg_symbol", "opt_type",
                  "strike", "qty", "entry_time", "entry_price", "sl", "exit_time",
@@ -256,7 +259,10 @@ HEARTBEAT_HEADERS = ["trading_date", "bar_time", "spot", "adx", "adxr", "chop",
 MARKET_OPEN = dt.time(9, 15)
 MARKET_CLOSE = dt.time(15, 30)
 CANDLE_MIN = 3
-POLL_BUFFER_SEC = 15
+# Seconds past the 3-minute boundary before the bar is fetched. A just-closed
+# candle can still be settling broker-side; waiting longer makes the live
+# decision match the settled historical record the backtest later reads.
+POLL_BUFFER_SEC = 35
 
 MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 MASTER_FALLBACK = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
@@ -681,6 +687,7 @@ class StraddleEngine:
         # is unavailable. Must exist before resume_from runs, since that method
         # returns early when there is nothing to restore.
         self._resume_mark = None
+        self._entry_diag = {}
 
     # ---- data ----
     def option_df(self, day, strike, ot):
@@ -700,20 +707,49 @@ class StraddleEngine:
 
     # ---- signals ----
     def entry_ok(self, nifty, vix, i, now):
+        """Records every input on self._entry_diag so a rejected bar can be
+        explained afterwards. Live decides on provisional intraday candles and
+        the backtest on the settled historical record; when those disagree the
+        diagnostics show which condition flipped and by how much."""
+        self._entry_diag = {"adx": None, "adxr": None, "adx_fall": None,
+                            "adxr_fall": None, "vix": None, "ok": False,
+                            "why": ""}
         if not (ENTRY_START <= now.time() <= ENTRY_END):
+            self._entry_diag["why"] = "outside window"
             return False
         if i < ADX_PERIOD*2:
+            self._entry_diag["why"] = "warm-up"
             return False
+
         adx, adxr, _, _ = compute_adx_adxr(nifty.iloc[: i+1], ADX_PERIOD)
+        a, ar = float(adx.iloc[-1]), float(adxr.iloc[-1])
+        af = is_falling(adx, len(adx)-1)
+        arf = is_falling(adxr, len(adxr)-1)
+        self._entry_diag.update(adx=round(a, 2), adxr=round(ar, 2),
+                                adx_fall=af, adxr_fall=arf)
+
         if vix is None or vix.empty or "ts" not in vix.columns:
+            self._entry_diag["why"] = "no VIX"
             return False
         vr = vix[vix.ts <= nifty.ts.iloc[i]]
         if vr.empty:
+            self._entry_diag["why"] = "no VIX bar"
             return False
         v = float(vr.close.iloc[-1])
-        cond = (adx.iloc[-1] < adxr.iloc[-1] and is_falling(adx, len(adx)-1)
-                and is_falling(adxr, len(adxr)-1))
-        return bool(cond and VIX_LOW <= v <= VIX_HIGH)
+        self._entry_diag["vix"] = round(v, 2)
+
+        fails = []
+        if not (a < ar):
+            fails.append(f"adx{a:.1f}>=adxr{ar:.1f}")
+        if not af:
+            fails.append("adx not falling 3")
+        if not arf:
+            fails.append("adxr not falling 3")
+        if not (VIX_LOW <= v <= VIX_HIGH):
+            fails.append(f"vix {v:.2f} outside {VIX_LOW}-{VIX_HIGH}")
+        self._entry_diag["ok"] = not fails
+        self._entry_diag["why"] = "OK" if not fails else "; ".join(fails)
+        return not fails
 
     def detect_trend(self, nifty, i):
         self._diag = None
@@ -1050,6 +1086,7 @@ class StraddleEngine:
         self._logged = set()
         self.last_ts = None
         self._resume_mark = None
+        self._entry_diag = {}
 
     def leg_ltp(self, day, leg, now):
         _, df = self.option_df(day, leg.strike, leg.opt_type)
@@ -1092,12 +1129,16 @@ class StraddleEngine:
                           f"L{ltp:.1f} SL{l.sl:.1f}" + (" NAKED" if l.naked else ""))
         real = self.state.pnl()
         unreal = self.unrealised(day, now)
+        d = self._entry_diag or {}
         return [now.strftime("%Y-%m-%d %H:%M:%S"), stamp, str(day), self.name,
                 round(spot, 2),
                 self._prev_trend or "NONE", self.state.straddle_count,
                 len(self.state.open_legs), len(self.state.closed_legs),
                 round(real, 2), round(unreal, 2), round(real + unreal, 2),
-                " | ".join(detail) if detail else "flat"]
+                " | ".join(detail) if detail else "flat",
+                _j(d.get("adx")), _j(d.get("adxr")),
+                _j(d.get("adx_fall")), _j(d.get("adxr_fall")),
+                _j(d.get("vix")), _j(d.get("ok")), d.get("why", "")]
 
     def new_trade_rows(self, day):
         """Sheet 3 — appended once per leg, when it closes."""
@@ -1278,7 +1319,29 @@ def _seconds_to_next_bar(now):
     return secs + POLL_BUFFER_SEC
 
 
-def live_engine_loop(stop_event, expiry, status, notify_on=False):
+TUNABLES = ["SL_MULTIPLIER", "TIGHT_SL_MULTIPLIER", "SL_FILL_AT_STOP",
+            "SL_SLIPPAGE_PTS", "NAKED_TRAIL_TRIGGER", "NAKED_TRAIL_BUFFER_PCT",
+            "NAKED_REBASE_ON_PARTNER_SL", "NAKED_STEP_ENABLED", "NAKED_STEP_PCT",
+            "NAKED_STEP_SL_PCT", "ST_PERIOD", "ST_MULT"]
+
+
+def snapshot_tunables():
+    return {k: globals()[k] for k in TUNABLES}
+
+
+def apply_tunables(cfg):
+    """Re-assert the engine's settings on the module globals.
+
+    Streamlit re-executes this file on every rerun, which resets each constant
+    to its file default. The sidebar normally re-applies the chosen values, but
+    it is locked while the engine runs — so without this the engine would
+    silently revert to defaults mid-session and stop matching the backtest.
+    """
+    if cfg:
+        globals().update(cfg)
+
+
+def live_engine_loop(stop_event, expiry, status, notify_on=False, cfg=None):
     """Daemon thread. Wakes just after each 3-minute close, feeds unseen bars
     into every engine, then writes the three sheets:
 
@@ -1290,8 +1353,11 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
     restart continues rather than beginning flat.
     """
     day = today_ist()
+    cfg = cfg or snapshot_tunables()
+    apply_tunables(cfg)
     status["state"] = "starting"
     status["log"] = []
+    status["cfg"] = cfg
 
     def note(msg):
         status["log"] = (status.get("log", []) + [f"{now_ist():%H:%M:%S}  {msg}"])[-60:]
@@ -1394,6 +1460,7 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False):
             break                    # fall through to finalisation, not return
 
         try:
+            apply_tunables(cfg)          # survive Streamlit reruns
             now = now_ist()
             frm = dt.datetime.combine(day - dt.timedelta(days=WARMUP_CALENDAR_DAYS),
                                       MARKET_OPEN)
@@ -1943,7 +2010,8 @@ if page == "Live run":
                     reg["started_at"] = now_ist()
                     th = threading.Thread(target=live_engine_loop,
                                           args=(reg["stop"], exp_live,
-                                                reg["status"], notify_on),
+                                                reg["status"], notify_on,
+                                                snapshot_tunables()),
                                           daemon=True, name=ENGINE_THREAD_NAME)
                     th.start()
                     reg["thread"] = th
@@ -2000,6 +2068,17 @@ if page == "Live run":
                              expanded=False):
                 st.dataframe(ST, use_container_width=True, hide_index=True,
                              height=320)
+
+    if running and status.get("cfg"):
+        c = status["cfg"]
+        fill = "at stop" if c["SL_FILL_AT_STOP"] else "at close"
+        if c["SL_FILL_AT_STOP"] and c["SL_SLIPPAGE_PTS"]:
+            fill += f" +{c['SL_SLIPPAGE_PTS']:g}"
+        lock = (f"{c['NAKED_STEP_PCT']:g}%/{c['NAKED_STEP_SL_PCT']:g}%"
+                if c["NAKED_STEP_ENABLED"] else "off")
+        st.caption(f"Settings frozen at start — base {c['SL_MULTIPLIER']:g}x · "
+                   f"SL fill {fill} · trigger {c['NAKED_TRAIL_TRIGGER']} · "
+                   f"profit lock {lock}")
 
     if running and reg.get("started_at"):
         st.caption(f"Engine started {reg['started_at']:%H:%M} IST · "
