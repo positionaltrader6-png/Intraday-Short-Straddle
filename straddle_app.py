@@ -204,14 +204,28 @@ ST_MULT = 2.0
 #   ST_TRAIL        stop ratchets down to the Supertrend line on the premium
 #   EMA_TRAIL       stop ratchets down to EMA(21) — kept for comparison
 #
-# name,            dynamic_sl, redeploy_mode,      max_legs, naked_mode
-SL_FIXED  = ("SL_1_3X",       False, REDEPLOY_IMMEDIATE, 3, "FIXED")
-SL_EMA    = ("SL_EMA21",      False, REDEPLOY_IMMEDIATE, 3, "EMA_CROSS_EXIT")
-SL_ST     = ("SL_SUPERTREND", False, REDEPLOY_IMMEDIATE, 3, "ST_TRAIL")
-SL_EMATRL = ("SL_EMA_TRAIL",  False, REDEPLOY_IMMEDIATE, 3, "EMA_TRAIL")
+# Two independent multipliers:
+#   base SL   both legs while the straddle is paired
+#   naked SL  the survivor's stop, re-based to its CURRENT premium x this
+# They need not match — a tighter stop can be justified once the leg is
+# unhedged, or a looser one to let the decay run.
+#
+# name,              redeploy,           legs, naked rule,       base, naked
+V = lambda n, nk, b, k: (n, False, REDEPLOY_IMMEDIATE, 3, nk, b, k)
 
-VARIANTS_LIVE = [SL_FIXED, SL_EMA, SL_ST]
-VARIANTS_BACKTEST = [SL_FIXED, SL_EMA, SL_ST, SL_EMATRL]
+B13_N13 = V("B13_NAKED13",  "FIXED",          1.30, 1.30)
+B13_N125= V("B13_NAKED125", "FIXED",          1.30, 1.25)
+B125_N125=V("B125_NAKED125","FIXED",          1.25, 1.25)
+B125_N13= V("B125_NAKED13", "FIXED",          1.25, 1.30)
+B13_EMA = V("B13_EMA21",    "EMA_CROSS_EXIT", 1.30, 1.30)
+B125_EMA= V("B125_EMA21",   "EMA_CROSS_EXIT", 1.25, 1.25)
+B13_ST  = V("B13_SUPERTREND", "ST_TRAIL",     1.30, 1.30)
+B125_ST = V("B125_SUPERTREND","ST_TRAIL",     1.25, 1.25)
+
+# Live runs the four most distinct; backtest runs the full grid.
+VARIANTS_LIVE = [B13_N13, B125_N125, B13_EMA, B13_ST]
+VARIANTS_BACKTEST = [B13_N13, B13_N125, B125_N125, B125_N13,
+                     B13_EMA, B125_EMA, B13_ST, B125_ST]
 
 # ---- SHEET LAYOUT -------------------------------------------------------
 # Sheet 1  constant name. The full leg ledger for the current day, rewritten
@@ -240,9 +254,10 @@ STATUS_HEADERS = ["updated_at", "trading_date", "strategy", "status", "straddle_
 LOG_HEADERS = ["bar_time", "written_at", "trading_date", "strategy", "spot", "trend",
                "straddles", "open_legs", "closed_legs", "realised_pnl",
                "unrealised_pnl", "total_pnl", "legs_detail",
-               # entry-condition inputs, so a rejected bar can be explained
+               # entry-condition inputs, so a rejected bar can be explained.
+               # vix_age_min shows how stale the VIX reading was.
                "adx", "adxr", "adx_falling", "adxr_falling", "vix",
-               "entry_ok", "entry_why"]
+               "vix_age_min", "entry_ok", "entry_why"]
 
 TRADE_HEADERS = ["trading_date", "strategy", "straddle_num", "leg_symbol", "opt_type",
                  "strike", "qty", "entry_time", "entry_price", "sl", "exit_time",
@@ -664,13 +679,18 @@ class DayState:
 # ============================== ENGINE ======================================
 class StraddleEngine:
     def __init__(self, name, dynamic_sl, redeploy_mode, max_open_legs,
-                 smart, lookup, expiry, option_cache, naked_mode=None):
+                 smart, lookup, expiry, option_cache, naked_mode=None,
+                 sl_mult=None, naked_mult=None):
         self.name = name
         self.dynamic_sl = dynamic_sl
         self.redeploy_mode = redeploy_mode
         self.max_open_legs = max_open_legs
         # per-engine, so several naked rules can run side by side on one feed
         self.naked_mode = naked_mode or NAKED_MODE
+        # per-engine, so 1.25x and 1.3x can run on one shared feed
+        self.sl_mult = sl_mult if sl_mult else SL_MULTIPLIER
+        # stop applied when the leg goes naked; defaults to the paired one
+        self.naked_mult = naked_mult if naked_mult else self.sl_mult
         self.smart = smart
         self.lookup = lookup
         self.expiry = expiry
@@ -712,8 +732,8 @@ class StraddleEngine:
         the backtest on the settled historical record; when those disagree the
         diagnostics show which condition flipped and by how much."""
         self._entry_diag = {"adx": None, "adxr": None, "adx_fall": None,
-                            "adxr_fall": None, "vix": None, "ok": False,
-                            "why": ""}
+                            "adxr_fall": None, "vix": None, "vix_age_min": None,
+                            "ok": False, "why": ""}
         if not (ENTRY_START <= now.time() <= ENTRY_END):
             self._entry_diag["why"] = "outside window"
             return False
@@ -736,7 +756,9 @@ class StraddleEngine:
             self._entry_diag["why"] = "no VIX bar"
             return False
         v = float(vr.close.iloc[-1])
+        age_min = (nifty.ts.iloc[i] - vr.ts.iloc[-1]).total_seconds() / 60.0
         self._entry_diag["vix"] = round(v, 2)
+        self._entry_diag["vix_age_min"] = round(age_min, 1)
 
         fails = []
         if not (a < ar):
@@ -845,7 +867,7 @@ class StraddleEngine:
         self.state.straddle_count += 1
         n = self.state.straddle_count
         for sym, ot, px in legs:
-            self.state.open_legs.append(Leg(sym, ot, strike, px, px*SL_MULTIPLIER,
+            self.state.open_legs.append(Leg(sym, ot, strike, px, px*self.sl_mult,
                                             LOT_SIZE, now, idx, straddle_num=n))
         self.log.append(f"{self.name}: {tag} straddle #{n} @ {now:%H:%M} strike {strike} "
                         f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f}")
@@ -854,8 +876,8 @@ class StraddleEngine:
             discord(
                 f"**{self.name}** — {tag} straddle #{n}\n"
                 f"`{now:%H:%M}`  strike **{strike}**  (spot {spot:.1f})\n"
-                f"SELL `{ce[0]}` @ **{ce[2]:.2f}**  ·  SL {ce[2]*SL_MULTIPLIER:.2f}\n"
-                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*SL_MULTIPLIER:.2f}",
+                f"SELL `{ce[0]}` @ **{ce[2]:.2f}**  ·  SL {ce[2]*self.sl_mult:.2f}\n"
+                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*self.sl_mult:.2f}",
                 tag="🟢")
         return True
 
@@ -1008,7 +1030,7 @@ class StraddleEngine:
                         if self.notify:
                             discord(f"**{self.name}** — SL tightened\n"
                                     f"`{now:%H:%M}`  `{leg.symbol}`\n"
-                                    f"SL {leg.entry_price*SL_MULTIPLIER:.2f} → "
+                                    f"SL {leg.entry_price*self.sl_mult:.2f} → "
                                     f"**{leg.sl:.2f}**  (trend {trend})", tag="🟠")
 
         # Trail naked stops first, so this bar is evaluated against the
@@ -1045,16 +1067,16 @@ class StraddleEngine:
                     ltp = self.leg_ltp(day, p, now)
                     old_sl = p.sl
                     if NAKED_REBASE_ON_PARTNER_SL:
-                        p.sl = ltp * SL_MULTIPLIER
+                        p.sl = ltp * self.naked_mult
                     p.base_sl = p.sl
                     self.log.append(f"{self.name}: {p.symbol} now naked · "
                                     f"SL re-based {old_sl:.2f} -> {p.sl:.2f} "
-                                    f"(LTP {ltp:.2f} x {SL_MULTIPLIER})")
+                                    f"(LTP {ltp:.2f} x {self.naked_mult})")
                     if self.notify:
                         discord(f"**{self.name}** — leg now naked\n"
                                 f"`{now:%H:%M}`  `{p.symbol}`  entry {p.entry_price:.2f}\n"
                                 f"SL re-based {old_sl:.2f} → **{p.sl:.2f}** "
-                                f"(LTP {ltp:.2f} × {SL_MULTIPLIER})\n"
+                                f"(LTP {ltp:.2f} × {self.naked_mult})\n"
                                 f"now trailing the 21 EMA", tag="⚠️")
                 if self.redeploy_mode == REDEPLOY_IMMEDIATE \
                         and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
@@ -1138,7 +1160,8 @@ class StraddleEngine:
                 " | ".join(detail) if detail else "flat",
                 _j(d.get("adx")), _j(d.get("adxr")),
                 _j(d.get("adx_fall")), _j(d.get("adxr_fall")),
-                _j(d.get("vix")), _j(d.get("ok")), d.get("why", "")]
+                _j(d.get("vix")), _j(d.get("vix_age_min")),
+                _j(d.get("ok")), d.get("why", "")]
 
     def new_trade_rows(self, day):
         """Sheet 3 — appended once per leg, when it closes."""
@@ -1279,8 +1302,8 @@ def run_dates(dates, run_type, variants, expiry_override=None,
     for n, day in enumerate(sorted(dates)):
         expiry = expiry_override or nearest_expiry(expiries, day)
         engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache,
-                                  naked_mode=nk)
-                   for nm, dyn, rd, ml, nk in variants]
+                                  naked_mode=nk, sl_mult=sm, naked_mult=km)
+                   for nm, dyn, rd, ml, nk, sm, km in variants]
         for e in engines:
             e.run_day(day, nifty, vix, fut, finalize=finalize)
             trades += e.new_trade_rows(day)
@@ -1367,8 +1390,8 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False, cfg=None):
         lookup, _ = option_universe()
         cache = {}
         engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache,
-                                  naked_mode=nk)
-                   for nm, dyn, rd, ml, nk in VARIANTS_LIVE]
+                                  naked_mode=nk, sl_mult=sm, naked_mult=km)
+                   for nm, dyn, rd, ml, nk, sm, km in VARIANTS_LIVE]
 
         try:
             prev = read_tab("LIVE", TAB_STATUS)
@@ -1436,6 +1459,22 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False, cfg=None):
             discord(f"**Startup failed**\n`{type(e).__name__}: {e}`", tag="❌")
         return
 
+    # Seed VIX from the warm-up window so the first hour is covered even if
+    # today's bars have not published yet.
+    vix = empty_candles()
+    vix_carried = 0
+    try:
+        seed_from = dt.datetime.combine(day - dt.timedelta(days=WARMUP_CALENDAR_DAYS),
+                                        MARKET_OPEN)
+        vix = candles(smart, INDIA_VIX_TOKEN, NSE, seed_from, now_ist())
+        if vix.empty:
+            note("VIX seed empty at startup — entries blocked until it publishes")
+        else:
+            note(f"VIX seeded: {len(vix)} bars, last {float(vix.close.iloc[-1]):.2f} "
+                 f"at {vix.ts.iloc[-1]:%d %b %H:%M}")
+    except Exception as e:
+        note(f"VIX seed failed: {e}")
+
     status["state"] = "running"
     last_ts = resume_ts        # None only on a genuinely fresh start
 
@@ -1468,10 +1507,20 @@ def live_engine_loop(stop_event, expiry, status, notify_on=False, cfg=None):
             if nifty.empty:
                 note("no NIFTY candles — retrying next cycle")
                 continue
-            vix = candles(smart, INDIA_VIX_TOKEN, NSE, frm, now)
+            vix_new = candles(smart, INDIA_VIX_TOKEN, NSE, frm, now)
             fut = candles(smart, NIFTY_FUT_TOKEN, NFO, frm, now)
-            if vix.empty:
-                note("VIX empty this cycle — entry filter cannot pass")
+            # India VIX is published late and intermittently on the historical
+            # endpoint. An empty fetch used to block entry outright — on
+            # 18 Sep that cost the 10:24 bar and the whole day diverged from
+            # the backtest. Keep the last good series and reuse it.
+            if not vix_new.empty:
+                vix = vix_new
+                vix_carried = 0
+            else:
+                vix_carried += 1
+                note(f"VIX fetch empty — carrying last good series "
+                     f"({vix_carried} cycle(s), "
+                     f"{'usable' if not vix.empty else 'NONE YET'})")
             if fut.empty:
                 note("futures empty this cycle — using spot for strikes")
 
@@ -1696,6 +1745,7 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checke
 .g2 { background:linear-gradient(135deg,#8b5cf6,#6366f1 60%,#4f46e5); }
 .g3 { background:linear-gradient(135deg,#06b6d4,#0ea5e9 60%,#3b82f6); }
 .g4 { background:linear-gradient(135deg,#f59e0b,#f97316 60%,#ef4444); }
+.g5 { background:linear-gradient(135deg,#10b981,#059669 60%,#047857); }
 .gneg { background:linear-gradient(135deg,#475569,#64748b); }
 .gmute { background:linear-gradient(135deg,#e6e0ee,#efeaf6); color:#7c6f8c;
   box-shadow:none; border:1px dashed #ddd2ea; }
@@ -1730,8 +1780,9 @@ div[data-baseweb="select"]>div, div[data-testid="stDateInput"] input {
 </style>
 """
 
-GRADS = {"SL_1_3X": "g1", "SL_EMA21": "g2", "SL_SUPERTREND": "g3",
-         "SL_EMA_TRAIL": "g4"}
+GRADS = {"B13_NAKED13": "g1", "B13_NAKED125": "g1", "B125_NAKED125": "g5",
+         "B125_NAKED13": "g5", "B13_EMA21": "g2", "B125_EMA21": "g2",
+         "B13_SUPERTREND": "g3", "B125_SUPERTREND": "g3"}
 
 
 def kpi(label, value, footnote="", grad="g1"):
@@ -1791,7 +1842,9 @@ def equity_chart(S):
                             axis=alt.Axis(gridColor="#f4e9f0", labelColor="#9b8aa6")),
                     color=alt.Color("strategy:N", title=None,
                                     scale=alt.Scale(domain=list(GRADS),
-                                                    range=["#ec4899", "#8b5cf6", "#0ea5e9", "#f59e0b"]),
+                                                    range=["#ec4899", "#f43f5e", "#10b981", "#059669",
+                                           "#8b5cf6", "#6366f1", "#0ea5e9",
+                                           "#06b6d4"]),
                                     legend=alt.Legend(orient="top")),
                     tooltip=["trading_date:T", "strategy:N", "cum:Q", "total_pnl:Q"])
             .properties(height=260).configure_view(strokeWidth=0))
@@ -1855,8 +1908,11 @@ with st.sidebar:
         st.caption("Locked while the engine is running — stop it to change these.")
 
     with st.expander("Adjust", expanded=False):
-        _slm = st.slider("Base SL (x premium)", 1.10, 1.60, SL_MULTIPLIER, 0.05,
-                         disabled=_engine_live)
+        _slm = st.slider("Default base SL (x premium)", 1.10, 1.60,
+                         SL_MULTIPLIER, 0.05, disabled=_engine_live,
+                         help="Each variant carries its own base and naked SL. "
+                              "This is only the fallback for an engine without "
+                              "one of its own.")
         _tsm = st.slider("Tightened SL (x premium)", 1.05, 1.50,
                          TIGHT_SL_MULTIPLIER, 0.05, disabled=_engine_live,
                          help="Applied to the hurt leg when DYNAMIC_SL confirms a trend.")
@@ -2025,6 +2081,10 @@ if page == "Live run":
                 reg["thread"] = None
                 st.rerun()
 
+    if not running and SESSION_OVER and TODAY.weekday() < 5:
+        st.caption("Session has ended for today. Starting the engine now will "
+                   "replay the completed day and write its record.")
+
     state = status.get("state", "idle")
     if running:
         st.success(f"Engine {state} · polls each 3-min bar close and writes to Sheets. "
@@ -2037,8 +2097,13 @@ if page == "Live run":
 
     summ = status.get("summary")
     if summ:
-        S_live = pd.DataFrame([{"strategy": k, "total_pnl": v["pnl"],
-                                "num_legs": v["closed"], "trading_date": str(TODAY)}
+        # .get with fallbacks: the summary dict gained realised/unrealised keys
+        # and a stale reader here crashed the page after the engine finished.
+        S_live = pd.DataFrame([{"strategy": k,
+                                "total_pnl": v.get("total", v.get("realised",
+                                                                  v.get("pnl", 0))),
+                                "num_legs": v.get("closed", 0),
+                                "trading_date": str(TODAY)}
                                for k, v in summ.items()])
         render_kpis(S_live, VARIANTS_LIVE, TODAY.strftime("%d %b"))
         det = pd.DataFrame([{"strategy": k, **v} for k, v in summ.items()])
@@ -2127,7 +2192,7 @@ elif page == "Backtest":
                f"trigger **{NAKED_TRAIL_TRIGGER}** · SL fill "
                f"**{'at stop' if SL_FILL_AT_STOP else 'at close'}"
                f"{f' +{SL_SLIPPAGE_PTS:g}' if SL_FILL_AT_STOP else ''}** · "
-               f"base **{SL_MULTIPLIER:g}x** — change these in the sidebar")
+               f"base SL per variant — change the rest in the sidebar")
 
     run_bt = st.button("Run backtest", type="primary")
 
