@@ -1,2307 +1,1106 @@
-"""
-NIFTY SHORT STRADDLE — STREAMLIT APP
-=====================================
-Three variants, one shared data feed, results persisted to Google Sheets.
-
-  FIXED_1_3X   both legs SL at 1.3x entry. On SL, partner goes naked and a
-               replacement straddle deploys immediately.
-  DYNAMIC_SL   same, but when a trend confirms, the hurt leg tightens to
-               1.25x. Only straddle #1 is eligible (TIGHTEN_MODE).
-In both variants, when one leg stops out its partner is carried on as a
-naked leg until its own SL or a 21-EMA reversal closes it.
-
-SHEETS
-------
-  Live_Status      constant. The current day's full leg ledger, rewritten
-                   every cycle. Also what the engine reads to resume.
-  Log_<date>       one row per strategy every 3 minutes, open to close.
-  Trades_<date>    one row per leg, appended when the leg closes.
-
-WHY THERE IS NO LIVE POLLING LOOP
----------------------------------
-Streamlit Cloud sleeps on inactivity and a browser session cannot hold a
-six-hour loop. It does not need to. Paper trading places no orders and acts
-only on COMPLETED candles, so replaying a finished session in one pass
-produces exactly the trades a 3-minute poller would have produced. Press
-"Run day" once after 15:30 and the result is identical.
-
-SETUP
------
-Repo contains exactly two files. No credentials, ever.
-
-    straddle_app.py
-    requirements.txt
-
-Streamlit -> Settings -> Secrets (stored outside the repo):
-
-    [angel]
-    api_key      = "<angel api key>"
-    client_code  = "<client code>"
-    password     = "<login pin>"
-    totp_secret  = "<totp seed>"
-
-    [sheets]
-    live_sheet_id     = "<spreadsheet id for live results>"
-    backtest_sheet_id = "<spreadsheet id for backtest results>"
-
-    [discord]                       # optional; alerts are skipped without it
-    webhook = "<discord webhook url>"
-
-    [gcp_service_account]           # service_account.json, converted to TOML
-    type         = "service_account"
-    project_id   = "..."
-    private_key  = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-    client_email = "...@....iam.gserviceaccount.com"
-    token_uri    = "https://oauth2.googleapis.com/token"
-
-Share BOTH spreadsheets with the service account's client_email as Editor.
-
-Add a .gitignore containing at least:
-
-    service_account.json
-    .streamlit/secrets.toml
-    *.csv
-
-Every secret is read through st.secrets at the point of use — nothing in this
-file is a literal credential.
-"""
-
-import datetime as dt
-import threading
-import time
-from zoneinfo import ZoneInfo
-from dataclasses import dataclass, field
-
-import altair as alt
-import numpy as np
-import pandas as pd
-import requests
 import streamlit as st
+import pandas as pd
+import datetime
+import random
+import io
 
-st.set_page_config(page_title="Straddle Desk", page_icon="◆", layout="wide",
-                   initial_sidebar_state="expanded")
-
-# ============================== CONSTANTS ===================================
-# Streamlit Cloud runs in UTC. Every time decision here — session state, the
-# candle-fetch cap, "today" — must be IST or the app silently asks the broker
-# for the wrong window and finds no data.
-IST = ZoneInfo("Asia/Kolkata")
-
-
-def now_ist():
-    return dt.datetime.now(IST).replace(tzinfo=None)
-
-
-def today_ist():
-    return dt.datetime.now(IST).date()
-
-
-NIFTY_INDEX_TOKEN = "99926000"
-NIFTY_FUT_TOKEN = "68407"          # front month — update after each roll
-INDIA_VIX_TOKEN = "99926017"
-NSE = "NSE"
-NFO = "NFO"
-INTERVAL = "THREE_MINUTE"
-API_SLEEP = 0.35
-
-LOT_SIZE = 75
-STRIKE_STEP = 50
-SL_MULTIPLIER = 1.3
-TIGHT_SL_MULTIPLIER = 1.25
-
-# How an SL exit is priced.
-#   True  — fill at the stop level. Matches a resting SL-limit or a manual
-#           exit taken at the trigger. Optimistic in one way: it assumes the
-#           limit was always filled, whereas a fast move can jump past it and
-#           leave the leg open with no stop.
-#   False — fill at the candle close when the bar closed beyond the stop.
-#           Pessimistic: assumes no exit was possible until the bar ended.
-# Measured on 11 Sep 2026, the two differed by 4,415 on four SL exits, so this
-# switch matters more than most strategy parameters.
-# ---- naked-leg behaviour, togglable so the variants can be measured ----
-# EMA_TRAIL       stop ratchets down to the 21 EMA, exits when hit
-# EMA_CROSS_EXIT  original: exit when the premium CLOSES above the 21 EMA,
-#                 stop stays at 1.3x
-# FIXED           no trail and no cross exit; keeps the re-based 1.3x stop
-NAKED_MODE = "EMA_TRAIL"
-
-# Which price triggers the trailed stop.
-#   HIGH   any wick touching the level — measured at 2.3x the frequency of a
-#          close cross on real 3-min data, ~20 vs ~9 touches per session
-#   CLOSE  only a completed close beyond the level
-NAKED_TRAIL_TRIGGER = "HIGH"
-
-# Keep the trailed stop this far above the EMA, in percent. 5.0 gives the leg
-# room to breathe without abandoning the trail.
-NAKED_TRAIL_BUFFER_PCT = 0.0
-
-# Stepped profit lock on a naked leg. Every NAKED_STEP_PCT of decay from its
-# entry premium, the stop is cut by NAKED_STEP_SL_PCT of its re-based level.
-# Entry 105, stop 136.50: at 30% decay (premium 73.5) the stop becomes 95.55,
-# turning a -2,362 risk into a +709 lock. Ratchets down only.
-# Applies to every variant, including the ones with no trail.
-NAKED_STEP_ENABLED = True
-NAKED_STEP_PCT = 30.0          # decay per step
-NAKED_STEP_SL_PCT = 30.0       # stop cut per step
-NAKED_STEP_MIN_SL = 1.0        # floor, so the stop can never reach zero
-
-# Re-base the surviving leg's stop to its CURRENT premium x SL_MULTIPLIER at
-# the moment its partner stops out. False keeps 1.3x the original entry.
-NAKED_REBASE_ON_PARTNER_SL = True
-
-SL_FILL_AT_STOP = True
-
-# Premium points added to an at-stop fill, to allow for imperfect execution.
-# 0.0 assumes a perfect fill at the trigger.
-SL_SLIPPAGE_PTS = 2.5
-
-EMA_PERIOD = 21
-ADX_PERIOD = 14
-TREND_ADX_PERIOD = 11
-ADX_MIN = 20.0
-FALLING_LOOKBACK = 3
-
-VIX_LOW, VIX_HIGH = 10.0, 14.0
-KC_PERIOD, KC_ATR_MULT = 20, 1.0
-CHOP_PERIOD = 14
-LOXX_PERIOD, LOXX_DEV, LOXX_WIDTH_MULT = 40, 1.0, 0.9
-
-MIN_TREND_BARS = (LOXX_PERIOD - 1) + int(LOXX_PERIOD ** 0.5)            # 45
-FULL_WARMUP_BARS = 2*(LOXX_PERIOD - 1) + int(LOXX_PERIOD ** 0.5) - 1    # 83
-# 3 calendar days. Measured: beyond two prior sessions ADX converges exactly
-# to its full-history value, so more adds nothing. A Monday after a Friday
-# holiday can still yield zero warm-up — the startup check warns for that.
-WARMUP_CALENDAR_DAYS = 3
-
-ENTRY_START = dt.time(9, 45)
-ENTRY_END = dt.time(14, 45)
-HARD_EXIT = dt.time(15, 0)
-
-MAX_STRADDLES_PER_DAY = 2
-TIGHTEN_MODE = "FIRST_STRADDLE_ONLY"   # FIRST_STRADDLE_ONLY | FRESH_TREND | ALWAYS
-REDEPLOY_IMMEDIATE = "IMMEDIATE"
-
-# A replacement straddle after an SL hit will not deploy past this time.
-REDEPLOY_CUTOFF = dt.time(14, 45)
-
-# Strikes either side of the rounded ATM to test. The winner is the strike
-# whose CE and PE premiums are closest — the market's true ATM, which the
-# forward basis can push one strike away from a simple spot rounding.
-STRIKE_SCAN = 1
-
-# Supertrend on the OPTION PREMIUM, used as a naked-leg trailing stop.
-# ATR-based, so it sits further from price than the 21 EMA — which matters,
-# because a stop trailing too tightly cuts the decaying leg early.
-ST_PERIOD = 10
-ST_MULT = 2.0
-
-# Each variant is one naked-leg rule. Entries, strike selection and the 1.3x
-# initial stop are identical across all of them, so any difference in results
-# is attributable to the naked leg alone.
-#
-#   FIXED           re-based 1.3x stop only; holds to the stop or 15:00
-#   EMA_CROSS_EXIT  1.3x stop, plus exit when the premium CLOSES above EMA(21)
-#   ST_TRAIL        stop ratchets down to the Supertrend line on the premium
-#   EMA_TRAIL       stop ratchets down to EMA(21) — kept for comparison
-#
-# Two independent multipliers:
-#   base SL   both legs while the straddle is paired
-#   naked SL  the survivor's stop, re-based to its CURRENT premium x this
-# They need not match — a tighter stop can be justified once the leg is
-# unhedged, or a looser one to let the decay run.
-#
-# name,              redeploy,           legs, naked rule,       base, naked
-V = lambda n, nk, b, k: (n, False, REDEPLOY_IMMEDIATE, 3, nk, b, k)
-
-B13_N13 = V("B13_NAKED13",  "FIXED",          1.30, 1.30)
-B13_N125= V("B13_NAKED125", "FIXED",          1.30, 1.25)
-B125_N125=V("B125_NAKED125","FIXED",          1.25, 1.25)
-B125_N13= V("B125_NAKED13", "FIXED",          1.25, 1.30)
-B13_EMA = V("B13_EMA21",    "EMA_CROSS_EXIT", 1.30, 1.30)
-B125_EMA= V("B125_EMA21",   "EMA_CROSS_EXIT", 1.25, 1.25)
-B13_ST  = V("B13_SUPERTREND", "ST_TRAIL",     1.30, 1.30)
-B125_ST = V("B125_SUPERTREND","ST_TRAIL",     1.25, 1.25)
-
-# Live runs the four most distinct; backtest runs the full grid.
-VARIANTS_LIVE = [B13_N13, B125_N125, B13_EMA, B13_ST]
-VARIANTS_BACKTEST = [B13_N13, B13_N125, B125_N125, B125_N13,
-                     B13_EMA, B125_EMA, B13_ST, B125_ST]
-
-# ---- SHEET LAYOUT -------------------------------------------------------
-# Sheet 1  constant name. The full leg ledger for the current day, rewritten
-#          every cycle: open legs with live LTP, closed legs with realised
-#          P&L. This is also what the engine reads to resume after a restart.
-# Sheet 2  Log_<date>. One row per strategy every 3 minutes, open to close.
-# Sheet 3  Trades_<date>. One row per leg, appended when the leg closes.
-TAB_STATUS = "Live_Status"
-
-
-def tab_log(day):
-    return f"Log_{day}"
-
-
-def tab_trades(day):
-    return f"Trades_{day}"
-
-
-STATUS_HEADERS = ["updated_at", "trading_date", "strategy", "status", "straddle_num",
-                  "leg_symbol", "opt_type", "strike", "qty", "entry_time",
-                  "entry_price", "sl", "ltp", "exit_time", "exit_price",
-                  "exit_reason", "leg_pnl", "naked", "sl_tightened", "carry_bars"]
-
-# bar_time first: this tab is the record of which bars have been processed,
-# and the engine reads its maximum on restart to know where to resume.
-LOG_HEADERS = ["bar_time", "written_at", "trading_date", "strategy", "spot", "trend",
-               "straddles", "open_legs", "closed_legs", "realised_pnl",
-               "unrealised_pnl", "total_pnl", "legs_detail",
-               # entry-condition inputs, so a rejected bar can be explained.
-               # vix_age_min shows how stale the VIX reading was.
-               "adx", "adxr", "adx_falling", "adxr_falling", "vix",
-               "vix_age_min", "entry_ok", "entry_why"]
-
-TRADE_HEADERS = ["trading_date", "strategy", "straddle_num", "leg_symbol", "opt_type",
-                 "strike", "qty", "entry_time", "entry_price", "sl", "exit_time",
-                 "exit_price", "exit_reason", "pnl", "naked", "sl_tightened",
-                 "carry_bars"]
-
-SUMMARY_HEADERS = ["run_type", "strategy", "trading_date", "total_pnl", "num_legs",
-                   "num_straddles", "naked_legs", "reversal_exits", "redeploys"]
-
-HEARTBEAT_HEADERS = ["trading_date", "bar_time", "spot", "adx", "adxr", "chop",
-                     "loxx_width", "loxx_width_avg", "width_ok", "momentum",
-                     "loxx_up", "loxx_dn", "kc_break_up", "kc_break_dn", "trend"]
-
-MARKET_OPEN = dt.time(9, 15)
-MARKET_CLOSE = dt.time(15, 30)
-CANDLE_MIN = 3
-# Seconds past the 3-minute boundary before the bar is fetched. A just-closed
-# candle can still be settling broker-side; waiting longer makes the live
-# decision match the settled historical record the backtest later reads.
-POLL_BUFFER_SEC = 35
-
-MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-MASTER_FALLBACK = "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
-
-
-# ============================== CONNECTIONS =================================
-def angel_login():
-    from SmartApi import SmartConnect
-    import pyotp
-    c = st.secrets["angel"]
-    o = SmartConnect(api_key=c["api_key"])
-    r = o.generateSession(c["client_code"], c["password"], pyotp.TOTP(c["totp_secret"]).now())
-    if not r.get("status"):
-        raise RuntimeError(f"Angel login failed: {r.get('message', r)}")
-    return o
-
-
-SHEET_KEYS = {"LIVE": "live_sheet_id", "BACKTEST": "backtest_sheet_id"}
-
-
-@st.cache_resource(show_spinner=False)
-def sheet(kind):
-    """Live and backtest results go to separate spreadsheets so a backtest
-    sweep can never be mistaken for accumulated live paper history."""
+# ── Optional Google Sheets ──────────────────────────────────────────────────
+try:
     import gspread
     from google.oauth2.service_account import Credentials
-    creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    key = st.secrets["sheets"][SHEET_KEYS[kind]]
-    return gspread.authorize(creds).open_by_key(key)
-
-
-def _j(v):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return ""
-    if isinstance(v, (np.bool_, bool)):
-        return bool(v)
-    if isinstance(v, np.integer):
-        return int(v)
-    if isinstance(v, np.floating):
-        f = float(v)
-        return "" if np.isnan(f) else round(f, 4)
-    if isinstance(v, (dt.date, dt.datetime, pd.Timestamp)):
-        return str(v)
-    return v
-
-
-ENGINE_THREAD_NAME = "straddle_engine"
-STALE_HEARTBEAT_MIN = 8      # a heartbeat older than this is treated as dead
-
-
-@st.cache_resource(show_spinner=False)
-def engine_registry():
-    """Process-level singleton holding the running engine.
-
-    st.session_state is per-browser-session, so a reload — or a second tab or
-    device — would lose the handle while the daemon thread kept running, and
-    the Start button would happily launch a second engine writing to the same
-    sheets. A cached_resource is shared by every session in the process.
-    """
-    return {"thread": None, "stop": None, "status": {}, "started_at": None}
-
-
-def live_engine_thread():
-    """Any engine thread alive in this process, registry or not."""
-    for t in threading.enumerate():
-        if t.name == ENGINE_THREAD_NAME and t.is_alive():
-            return t
-    return None
-
-
-def sheet_heartbeat_age_min():
-    """Minutes since Live_Status was last written. Catches an engine running
-    in a *different* container, which the in-process registry cannot see.
-    Returns None if unknown."""
-    try:
-        d = read_tab("LIVE", TAB_STATUS)
-        if d.empty or "updated_at" not in d.columns:
-            return None
-        ts = pd.to_datetime(d["updated_at"], errors="coerce").dropna()
-        if not len(ts):
-            return None
-        return (now_ist() - ts.max().to_pydatetime()).total_seconds() / 60.0
-    except Exception:
-        return None
-
-
-SHEET_FONT = "Tahoma"
-
-
-def style_tab(ws, ncols):
-    """Tahoma, centred and middle-aligned. Header row bold on a tinted
-    background. Applied once when a tab is created — ws.clear() wipes values
-    but keeps formatting, so a rewritten tab stays styled."""
-    last = chr(ord("A") + ncols - 1) if ncols <= 26 else "Z"
-    body = {"horizontalAlignment": "CENTER",
-            "verticalAlignment": "MIDDLE",
-            "textFormat": {"fontFamily": SHEET_FONT, "fontSize": 10}}
-    head = {"horizontalAlignment": "CENTER",
-            "verticalAlignment": "MIDDLE",
-            "backgroundColor": {"red": 0.93, "green": 0.90, "blue": 0.97},
-            "textFormat": {"fontFamily": SHEET_FONT, "fontSize": 10,
-                           "bold": True}}
-    try:
-        ws.format(f"A:{last}", body)
-        ws.format(f"A1:{last}1", head)
-        ws.freeze(rows=1)
-    except Exception:
-        pass          # cosmetic only — never block a write
-
-
-def append_rows(kind, tab, headers, rows):
-    if not rows:
-        return 0
-    import gspread
-    sh = sheet(kind)
-    try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=5000, cols=max(len(headers), 12))
-        ws.append_row([h.upper() for h in headers])
-        style_tab(ws, len(headers))
-    ws.append_rows([[_j(v) for v in r] for r in rows], value_input_option="USER_ENTERED")
-    return len(rows)
-
-
-def replace_tab(kind, tab, headers, rows):
-    """Rewrite a tab whole. Used for the status sheet, which mirrors current
-    state rather than accumulating history."""
-    import gspread
-    sh = sheet(kind)
-    created = False
-    try:
-        ws = sh.worksheet(tab)
-        ws.clear()
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=400, cols=len(headers))
-        created = True
-    ws.update(values=[[h.upper() for h in headers]]
-              + [[_j(v) for v in r] for r in rows],
-              value_input_option="USER_ENTERED")
-    if created:
-        style_tab(ws, len(headers))
-    return len(rows)
-
-
-def rows_from_df(df, headers):
-    """Read-back rows in header order, so a rewritten tab keeps its shape even
-    if a column is missing from the sheet."""
-    if df.empty:
-        return []
-    out = []
-    for _, r in df.iterrows():
-        out.append([r[h] if h in df.columns else "" for h in headers])
-    return out
-
-
-def list_tabs(kind, prefix):
-    try:
-        return sorted(w.title for w in sheet(kind).worksheets()
-                      if w.title.startswith(prefix))
-    except Exception:
-        return []
-
-
-def read_tab(kind, tab):
-    import gspread
-    try:
-        ws = sheet(kind).worksheet(tab)
-    except gspread.WorksheetNotFound:
-        return pd.DataFrame()
-    v = ws.get_all_records()
-    if not v:
-        return pd.DataFrame()
-    df = pd.DataFrame(v)
-    # headers are written in caps for display; normalise for code access
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
-
-
-# ============================== MARKET DATA =================================
-# ============================== DISCORD =====================================
-def discord_url():
-    try:
-        return st.secrets["discord"]["webhook"]
-    except Exception:
-        return None
-
-
-def discord(msg, tag=""):
-    """Fire-and-forget notification. A webhook failure must never interrupt
-    the engine, so every error is swallowed after one retry."""
-    url = discord_url()
-    if not url:
-        return False
-    body = {"content": (f"{tag} " if tag else "") + msg}
-    for attempt in range(2):
-        try:
-            r = requests.post(url, json=body, timeout=6)
-            if r.status_code in (200, 204):
-                return True
-            if r.status_code == 429:          # rate limited
-                time.sleep(float(r.headers.get("Retry-After", 2)))
-                continue
-            return False
-        except Exception:
-            time.sleep(1)
-    return False
-
-
-CANDLE_COLS = ["ts", "open", "high", "low", "close", "volume"]
-
-
-def empty_candles():
-    """An empty frame WITH the expected columns. A bare pd.DataFrame() has no
-    columns, so downstream `.ts` access raises AttributeError instead of just
-    being empty — which is how a failed VIX or futures fetch used to crash a run."""
-    return pd.DataFrame(columns=CANDLE_COLS)
-
-
-def candles(smart, token, exchange, frm, to):
-    p = {"exchange": exchange, "symboltoken": str(token), "interval": INTERVAL,
-         "fromdate": frm.strftime("%Y-%m-%d %H:%M"), "todate": to.strftime("%Y-%m-%d %H:%M")}
-    for a in range(3):
-        try:
-            r = smart.getCandleData(p)
-        except Exception:
-            time.sleep(API_SLEEP * 4 ** a); continue
-        time.sleep(API_SLEEP)
-        if r.get("status") and r.get("data"):
-            df = pd.DataFrame(r["data"], columns=CANDLE_COLS)
-            df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize(None)
-            return df
-        time.sleep(API_SLEEP * 4 ** a)
-    return empty_candles()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def option_universe():
-    import requests
-    try:
-        r = requests.get(MASTER_URL, timeout=30); r.raise_for_status()
-    except Exception:
-        r = requests.get(MASTER_FALLBACK, timeout=30); r.raise_for_status()
-    lookup, exp = {}, set()
-    for i in r.json():
-        if i.get("name") != "NIFTY" or i.get("instrumenttype") != "OPTIDX":
-            continue
-        lookup[i["symbol"]] = i["token"]
-        try:
-            exp.add(dt.datetime.strptime(i["expiry"], "%d%b%Y").date())
-        except Exception:
-            pass
-    return lookup, sorted(exp)
-
-
-def nearest_expiry(expiries, day):
-    f = [e for e in expiries if e >= day]
-    if not f:
-        raise RuntimeError(f"No NIFTY expiry on/after {day}")
-    return f[0]
-
-
-def expiry_choices(expiries, day, n=6):
-    """Expiries on or after `day`, nearest first."""
-    return [e for e in expiries if e >= day][:n]
-
-
-def opt_symbol(expiry, strike, ot):
-    return f"NIFTY{expiry.strftime('%d%b%y').upper()}{strike}{ot}"
-
-
-# ============================== INDICATORS ==================================
-def true_range(df):
-    h, l, c = df.high, df.low, df.close
-    return pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-
-
-def compute_adx_adxr(df, period=ADX_PERIOD):
-    h, l = df.high, df.low
-    up, dn = h.diff(), -l.diff()
-    pdm = np.where((up > dn) & (up > 0), up, 0.0)
-    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    atr = true_range(df).ewm(alpha=1/period, adjust=False).mean()
-    pdi = 100*pd.Series(pdm, index=df.index).ewm(alpha=1/period, adjust=False).mean()/atr
-    mdi = 100*pd.Series(mdm, index=df.index).ewm(alpha=1/period, adjust=False).mean()/atr
-    dx = 100*(pdi-mdi).abs()/(pdi+mdi)
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-    return adx, (adx+adx.shift(period))/2.0, pdi, mdi
-
-
-def is_falling(s, idx, lookback=FALLING_LOOKBACK):
-    w = s.iloc[max(0, idx-lookback+1): idx+1]
-    if len(w) < lookback or w.isna().any():
-        return False
-    return all(w.iloc[i] > w.iloc[i+1] for i in range(len(w)-1))
-
-
-def compute_ema(s, period=EMA_PERIOD):
-    return s.ewm(span=period, adjust=False).mean()
-
-
-def compute_keltner(df, period=KC_PERIOD, mult=KC_ATR_MULT):
-    basis = df.close.ewm(span=period, adjust=False).mean()
-    atr = true_range(df).ewm(alpha=1/period, adjust=False).mean()
-    return basis+mult*atr, basis, basis-mult*atr
-
-
-def compute_chop(df, period=CHOP_PERIOD):
-    atr_sum = true_range(df).rolling(period).sum()
-    den = (df.high.rolling(period).max()-df.low.rolling(period).min()).replace(0, np.nan)
-    return 100*np.log10(atr_sum/den)/np.log10(period)
-
-
-def compute_lwma(s, p):
-    w = np.arange(1, p+1)
-    return s.rolling(p).apply(lambda x: (x*w).sum()/w.sum(), raw=True)
-
-
-def compute_loxx_hlhvb(df, period=LOXX_PERIOD, dev=LOXX_DEV):
-    """Loxx HLHVB. The MIDLINE supplies direction via its slope; band width is
-    a separate squeeze filter. Using width alone as the trend test was why
-    trend detection almost never fired."""
-    me = compute_lwma(2*compute_lwma(df.close, int(period/2)) - compute_lwma(df.close, period),
-                      int(period ** 0.5))
-    d = (df.high-df.low).rolling(period).std(ddof=1)
-    return me+d*dev, me, me-d*dev
-
-
-def compute_supertrend(df, period=ST_PERIOD, mult=ST_MULT):
-    """Supertrend on an option premium series. Returns (line, direction).
-    direction +1 = price above the line, -1 = below."""
-    hl2 = (df.high + df.low) / 2.0
-    atr = true_range(df).ewm(alpha=1/period, adjust=False).mean()
-    ub, lb = hl2 + mult*atr, hl2 - mult*atr
-    n = len(df)
-    U = np.full(n, np.nan); L = np.full(n, np.nan); D = np.ones(n, dtype=int)
-    c = df.close.to_numpy()
-    for i in range(n):
-        if i == 0 or np.isnan(ub.iloc[i]):
-            U[i], L[i] = ub.iloc[i], lb.iloc[i]; continue
-        U[i] = ub.iloc[i] if (ub.iloc[i] < U[i-1] or c[i-1] > U[i-1]) else U[i-1]
-        L[i] = lb.iloc[i] if (lb.iloc[i] > L[i-1] or c[i-1] < L[i-1]) else L[i-1]
-        D[i] = 1 if c[i] > U[i-1] else (-1 if c[i] < L[i-1] else D[i-1])
-    return pd.Series(np.where(D == 1, L, U), index=df.index), pd.Series(D, index=df.index)
-
-
-def _rising(s):
-    return bool(s.iloc[-1] > s.iloc[-2]) if len(s) > 1 and s.iloc[-2:].notna().all() else False
-
-
-def _falling(s):
-    return bool(s.iloc[-1] < s.iloc[-2]) if len(s) > 1 and s.iloc[-2:].notna().all() else False
-
-
-# ============================== STATE =======================================
-@dataclass
-class Leg:
-    symbol: str
-    opt_type: str
-    strike: int
-    entry_price: float
-    sl: float
-    qty: int
-    entry_time: dt.datetime
-    entry_idx: int
-    straddle_num: int = 1
-    naked: bool = False
-    naked_since: int = None
-    sl_tightened: bool = False
-    base_sl: float = None          # stop the stepped profit lock scales from
-    steps_locked: int = 0
-    exit_price: float = None
-    exit_time: dt.datetime = None
-    exit_reason: str = None
-    exit_idx: int = None
-
-    @property
-    def carry_bars(self):
-        if self.naked_since is None or self.exit_idx is None:
-            return 0
-        return self.exit_idx - self.naked_since
-
-
-@dataclass
-class DayState:
-    open_legs: list = field(default_factory=list)
-    closed_legs: list = field(default_factory=list)
-    straddle_count: int = 0
-    redeploys: int = 0
-    done: bool = False
-
-    def pnl(self):
-        return sum((l.entry_price-l.exit_price)*l.qty
-                   for l in self.closed_legs if l.exit_price is not None)
-
-
-# ============================== ENGINE ======================================
-class StraddleEngine:
-    def __init__(self, name, dynamic_sl, redeploy_mode, max_open_legs,
-                 smart, lookup, expiry, option_cache, naked_mode=None,
-                 sl_mult=None, naked_mult=None):
-        self.name = name
-        self.dynamic_sl = dynamic_sl
-        self.redeploy_mode = redeploy_mode
-        self.max_open_legs = max_open_legs
-        # per-engine, so several naked rules can run side by side on one feed
-        self.naked_mode = naked_mode or NAKED_MODE
-        # per-engine, so 1.25x and 1.3x can run on one shared feed
-        self.sl_mult = sl_mult if sl_mult else SL_MULTIPLIER
-        # stop applied when the leg goes naked; defaults to the paired one
-        self.naked_mult = naked_mult if naked_mult else self.sl_mult
-        self.smart = smart
-        self.lookup = lookup
-        self.expiry = expiry
-        self.cache = option_cache
-        self.state = DayState()
-        self.heartbeat = []
-        self._prev_trend = None
-        self._diag = None
-        self.log = []
-        self.notify = False          # only the live engine turns this on
-        self._logged = set()
-        self.last_ts = None
-        # newest known leg activity, used as a resume point when the log tab
-        # is unavailable. Must exist before resume_from runs, since that method
-        # returns early when there is nothing to restore.
-        self._resume_mark = None
-        self._entry_diag = {}
-
-    # ---- data ----
-    def option_df(self, day, strike, ot):
-        key = (day, strike, ot)
-        if key in self.cache:
-            return self.cache[key]
-        sym = opt_symbol(self.expiry, strike, ot)
-        tok = self.lookup.get(sym)
-        if tok is None:
-            self.cache[key] = (sym, pd.DataFrame())
-            return self.cache[key]
-        df = candles(self.smart, tok, NFO,
-                     dt.datetime.combine(day, dt.time(9, 15)),
-                     dt.datetime.combine(day, dt.time(15, 30)))
-        self.cache[key] = (sym, df)
-        return self.cache[key]
-
-    # ---- signals ----
-    def entry_ok(self, nifty, vix, i, now):
-        """Records every input on self._entry_diag so a rejected bar can be
-        explained afterwards. Live decides on provisional intraday candles and
-        the backtest on the settled historical record; when those disagree the
-        diagnostics show which condition flipped and by how much."""
-        self._entry_diag = {"adx": None, "adxr": None, "adx_fall": None,
-                            "adxr_fall": None, "vix": None, "vix_age_min": None,
-                            "ok": False, "why": ""}
-        if not (ENTRY_START <= now.time() <= ENTRY_END):
-            self._entry_diag["why"] = "outside window"
-            return False
-        if i < ADX_PERIOD*2:
-            self._entry_diag["why"] = "warm-up"
-            return False
-
-        adx, adxr, _, _ = compute_adx_adxr(nifty.iloc[: i+1], ADX_PERIOD)
-        a, ar = float(adx.iloc[-1]), float(adxr.iloc[-1])
-        af = is_falling(adx, len(adx)-1)
-        arf = is_falling(adxr, len(adxr)-1)
-        self._entry_diag.update(adx=round(a, 2), adxr=round(ar, 2),
-                                adx_fall=af, adxr_fall=arf)
-
-        if vix is None or vix.empty or "ts" not in vix.columns:
-            self._entry_diag["why"] = "no VIX"
-            return False
-        vr = vix[vix.ts <= nifty.ts.iloc[i]]
-        if vr.empty:
-            self._entry_diag["why"] = "no VIX bar"
-            return False
-        v = float(vr.close.iloc[-1])
-        age_min = (nifty.ts.iloc[i] - vr.ts.iloc[-1]).total_seconds() / 60.0
-        self._entry_diag["vix"] = round(v, 2)
-        self._entry_diag["vix_age_min"] = round(age_min, 1)
-
-        fails = []
-        if not (a < ar):
-            fails.append(f"adx{a:.1f}>=adxr{ar:.1f}")
-        if not af:
-            fails.append("adx not falling 3")
-        if not arf:
-            fails.append("adxr not falling 3")
-        if not (VIX_LOW <= v <= VIX_HIGH):
-            fails.append(f"vix {v:.2f} outside {VIX_LOW}-{VIX_HIGH}")
-        self._entry_diag["ok"] = not fails
-        self._entry_diag["why"] = "OK" if not fails else "; ".join(fails)
-        return not fails
-
-    def detect_trend(self, nifty, i):
-        self._diag = None
-        if i < MIN_TREND_BARS:
-            return None
-        sub = nifty.iloc[: i+1]
-        adx, adxr, pdi, mdi = compute_adx_adxr(sub, TREND_ADX_PERIOD)
-        chop = compute_chop(sub)
-        kcu, kcb, kcl = compute_keltner(sub)
-        lu, lme, ld = compute_loxx_hlhvb(sub)
-        width = lu-ld
-        wavg = width.rolling(LOXX_PERIOD).mean()
-        close = float(sub.close.iloc[-1]); hi = float(sub.high.iloc[-1]); lo = float(sub.low.iloc[-1])
-
-        # NaN width_avg means the squeeze filter has not warmed up; skip it
-        # rather than vetoing the whole check.
-        wa = wavg.iloc[-1]
-        width_ok = bool(width.iloc[-1] <= wa*LOXX_WIDTH_MULT) if pd.notna(wa) else True
-
-        a, ar = adx.iloc[-1], adxr.iloc[-1]
-        momentum = bool(pd.notna(a) and pd.notna(ar) and a > ADX_MIN and a > ar
-                        and _rising(adx) and _rising(adxr) and _falling(chop))
-        up_ok = bool(pd.notna(ld.iloc[-1]) and close > ld.iloc[-1] and _rising(lme))
-        dn_ok = bool(pd.notna(lu.iloc[-1]) and close < lu.iloc[-1] and _falling(lme))
-        bku = bool(close > kcu.iloc[-1]); bkd = bool(close < kcl.iloc[-1])
-
-        trend = None
-        if bku and _rising(kcb) and lo > kcl.iloc[-1] and pdi.iloc[-1] > mdi.iloc[-1] \
-                and up_ok and momentum and width_ok:
-            trend = "UP"
-        elif bkd and _falling(kcb) and hi < kcu.iloc[-1] and mdi.iloc[-1] > pdi.iloc[-1] \
-                and dn_ok and momentum and width_ok:
-            trend = "DOWN"
-
-        self._diag = [round(close, 2), _j(a), _j(ar), _j(chop.iloc[-1]),
-                      _j(width.iloc[-1]), _j(wa), width_ok, momentum,
-                      up_ok, dn_ok, bku, bkd, trend or ""]
-        return trend
-
-    def _may_tighten(self, leg, fresh):
-        if leg.sl_tightened:
-            return False
-        if TIGHTEN_MODE == "FIRST_STRADDLE_ONLY":
-            return leg.straddle_num == 1
-        if TIGHTEN_MODE == "FRESH_TREND":
-            return fresh
-        return True
-
-    # ---- positions ----
-    def deploy(self, day, spot, fut, now, idx, tag="ENTRY"):
-        if tag != "ENTRY" and now.time() > REDEPLOY_CUTOFF:
-            self.log.append(f"{self.name}: {tag} skipped — past {REDEPLOY_CUTOFF:%H:%M}")
-            return False
-        if self.state.straddle_count >= MAX_STRADDLES_PER_DAY:
-            return False
-        if len(self.state.open_legs) + 2 > self.max_open_legs:
-            return False
-
-        base_price = fut if day.weekday() == 0 else spot
-        atm = int(round(base_price / STRIKE_STEP) * STRIKE_STEP)
-        candidates = [atm + k * STRIKE_STEP
-                      for k in range(-STRIKE_SCAN, STRIKE_SCAN + 1)]
-
-        best_diff, best_strike, best_legs = float("inf"), None, []
-        probe = []
-        for test_strike in candidates:
-            temp_legs, valid = [], True
-            for ot in ("CE", "PE"):
-                sym, df = self.option_df(day, test_strike, ot)
-                if df.empty:
-                    valid = False; break
-                row = df[df.ts <= now]
-                if row.empty:
-                    valid = False; break
-                temp_legs.append((sym, ot, float(row.close.iloc[-1])))
-            if not (valid and len(temp_legs) == 2):
-                probe.append(f"{test_strike}: no data")
-                continue
-            diff = abs(temp_legs[0][2] - temp_legs[1][2])
-            probe.append(f"{test_strike}: CE {temp_legs[0][2]:.1f} "
-                         f"PE {temp_legs[1][2]:.1f} d{diff:.1f}")
-            if diff < best_diff:
-                best_diff, best_strike, best_legs = diff, test_strike, temp_legs
-
-        self.log.append(f"{self.name}: scan (spot {base_price:.1f}, atm {atm}) — "
-                        + " | ".join(probe))
-        if best_strike is None:
-            self.log.append(f"{self.name}: {tag} failed — no option data for {candidates}")
-            return False
-
-        strike, legs = best_strike, best_legs
-
-        self.state.straddle_count += 1
-        n = self.state.straddle_count
-        for sym, ot, px in legs:
-            self.state.open_legs.append(Leg(sym, ot, strike, px, px*self.sl_mult,
-                                            LOT_SIZE, now, idx, straddle_num=n))
-        self.log.append(f"{self.name}: {tag} straddle #{n} @ {now:%H:%M} strike {strike} "
-                        f"CE {legs[0][2]:.2f} PE {legs[1][2]:.2f}")
-        if self.notify:
-            ce, pe = legs[0], legs[1]
-            discord(
-                f"**{self.name}** — {tag} straddle #{n}\n"
-                f"`{now:%H:%M}`  strike **{strike}**  (spot {spot:.1f})\n"
-                f"SELL `{ce[0]}` @ **{ce[2]:.2f}**  ·  SL {ce[2]*self.sl_mult:.2f}\n"
-                f"SELL `{pe[0]}` @ **{pe[2]:.2f}**  ·  SL {pe[2]*self.sl_mult:.2f}",
-                tag="🟢")
-        return True
-
-    def sl_fill(self, leg, day, now):
-        _, df = self.option_df(day, leg.strike, leg.opt_type)
-        if df.empty:
-            return None
-        row = df[df.ts == now]
-        if row.empty:
-            # Illiquid strikes skip bars with no trades. Falling back to the
-            # newest bar at or before `now` keeps the stop evaluated instead
-            # of silently skipping it.
-            row = df[df.ts <= now].tail(1)
-            if row.empty:
-                return None
-        hi, cl = float(row.high.iloc[0]), float(row.close.iloc[0])
-        # A naked leg on an EMA trail can be judged on the close instead of the
-        # wick. On real 3-min data the wick touches 2.3x as often, which cuts
-        # the decaying leg far earlier.
-        trailing = self.naked_mode in ("EMA_TRAIL", "ST_TRAIL")
-        trigger = cl if (leg.naked and trailing
-                         and NAKED_TRAIL_TRIGGER == "CLOSE") else hi
-        if trigger < leg.sl:
-            return None
-        if SL_FILL_AT_STOP:
-            return leg.sl + SL_SLIPPAGE_PTS
-        # close-based: if the bar ended beyond the stop, assume no better exit
-        return max(leg.sl, cl) if cl >= leg.sl else leg.sl
-
-    def step_naked_sl(self, leg, day, now):
-        """Ratchet the stop down one notch per NAKED_STEP_PCT of decay.
-
-        Independent of the trail modes — a FIXED leg still locks profit as the
-        premium falls, without the early cuts a tight trail causes.
-        """
-        if not NAKED_STEP_ENABLED or leg.entry_price <= 0:
-            return None
-        base = leg.base_sl if leg.base_sl else leg.sl
-        ltp = self.leg_ltp(day, leg, now)
-        decay = (leg.entry_price - ltp) / leg.entry_price
-        steps = int(decay // (NAKED_STEP_PCT / 100.0))
-        if steps <= leg.steps_locked or steps <= 0:
-            return None
-        target = base * (1.0 - (NAKED_STEP_SL_PCT / 100.0) * steps)
-        target = max(target, NAKED_STEP_MIN_SL)
-        if target >= leg.sl:
-            leg.steps_locked = steps        # already tighter; just record it
-            return None
-        old = leg.sl
-        leg.sl = target
-        leg.steps_locked = steps
-        return old
-
-    def trail_naked_sl(self, leg, day, now):
-        """Ratchet a naked leg's stop down to the 21 EMA of its own premium.
-
-        The leg is short, so the stop sits above price. As the premium decays
-        the EMA falls and drags the stop with it; it never moves back up.
-        This replaces the earlier close-above-EMA exit, which gave back the
-        whole distance between the fixed stop and the EMA.
-        """
-        _, df = self.option_df(day, leg.strike, leg.opt_type)
-        h = df[df.ts <= now] if not df.empty else pd.DataFrame()
-        if len(h) < EMA_PERIOD + 2:
-            return None
-        if self.naked_mode == "EMA_TRAIL":
-            base = float(compute_ema(h.close).iloc[-1])
-        elif self.naked_mode == "ST_TRAIL":
-            line, _d = compute_supertrend(h)
-            base = float(line.iloc[-1])
-        else:
-            return None
-        if pd.isna(base) or base <= 0:
-            return None
-        level = base * (1.0 + NAKED_TRAIL_BUFFER_PCT / 100.0)
-        if level < leg.sl:
-            old = leg.sl
-            leg.sl = level
-            return old
-        return None
-
-    def naked_cross_exit(self, leg, day, now):
-        """Original behaviour: exit when the premium CLOSES above its 21 EMA."""
-        if self.naked_mode != "EMA_CROSS_EXIT":
-            return False
-        _, df = self.option_df(day, leg.strike, leg.opt_type)
-        h = df[df.ts <= now] if not df.empty else pd.DataFrame()
-        if len(h) < EMA_PERIOD + 2:
-            return False
-        e = compute_ema(h.close)
-        return bool(h.close.iloc[-2] <= e.iloc[-2] and h.close.iloc[-1] > e.iloc[-1])
-
-    def exit_leg(self, leg, px, reason, now, idx):
-        leg.exit_price = px; leg.exit_time = now
-        leg.exit_reason = reason; leg.exit_idx = idx
-        self.state.open_legs.remove(leg)
-        self.state.closed_legs.append(leg)
-        pnl = (leg.entry_price - px) * leg.qty
-        self.log.append(f"{self.name}: exit {leg.symbol} @ {px:.2f} ({reason}) "
-                        f"pnl {pnl:+.0f}")
-        if self.notify:
-            icon = {"SL_HIT": "🔴", "NAKED_SL_HIT": "🟡",
-                    "EOD_15_00": "⚪", "FORCED_DAY_END": "⚪"}.get(reason, "🔵")
-            extra = ""
-            if leg.naked:
-                extra += f"  ·  carried naked {leg.carry_bars} bars"
-            if leg.sl_tightened:
-                extra += "  ·  SL was tightened"
-            discord(
-                f"**{self.name}** — exit  ({reason})\n"
-                f"`{now:%H:%M}`  `{leg.symbol}`\n"
-                f"entry {leg.entry_price:.2f} → exit **{px:.2f}**  ·  "
-                f"SL {leg.sl:.2f}\n"
-                f"P&L **{pnl:+,.0f}**  ·  day total {self.state.pnl() + pnl:+,.0f}{extra}",
-                tag=icon)
-
-    def partner(self, leg):
-        c = [l for l in self.state.open_legs
-             if l.opt_type != leg.opt_type and not l.naked
-             and l.straddle_num == leg.straddle_num]
-        return c[0] if c else None
-
-    def on_bar(self, day, nifty, i, local_i, now, spot, fut):
-        """local_i is unused; kept so run_day and the threaded engine
-        can call this identically."""
-        if now.time() >= HARD_EXIT and not self.state.done:
-            for leg in list(self.state.open_legs):
-                _, df = self.option_df(day, leg.strike, leg.opt_type)
-                r = df[df.ts <= now]
-                self.exit_leg(leg, float(r.close.iloc[-1]) if not r.empty else leg.entry_price,
-                              "EOD_15_00", now, i)
-            self.state.done = True
-        if self.state.done:
-            return
-
-        if self.dynamic_sl:
-            trend = self.detect_trend(nifty, i)
-            if self._diag is not None:
-                self.heartbeat.append([str(day), now.strftime("%H:%M:%S")] + self._diag)
-            fresh = trend is not None and trend != self._prev_trend
-            self._prev_trend = trend
-            if trend and self.state.open_legs:
-                hurt = "CE" if trend == "UP" else "PE"
-                for leg in self.state.open_legs:
-                    if leg.opt_type == hurt and self._may_tighten(leg, fresh):
-                        leg.sl = leg.entry_price*TIGHT_SL_MULTIPLIER
-                        leg.sl_tightened = True
-                        self.log.append(f"{self.name}: {leg.symbol} SL -> {leg.sl:.2f} "
-                                        f"(trend {trend}, straddle #{leg.straddle_num})")
-                        if self.notify:
-                            discord(f"**{self.name}** — SL tightened\n"
-                                    f"`{now:%H:%M}`  `{leg.symbol}`\n"
-                                    f"SL {leg.entry_price*self.sl_mult:.2f} → "
-                                    f"**{leg.sl:.2f}**  (trend {trend})", tag="🟠")
-
-        # Trail naked stops first, so this bar is evaluated against the
-        # updated level rather than the previous one.
-        for leg in self.state.open_legs:
-            if leg.naked:
-                stepped = self.step_naked_sl(leg, day, now)
-                if stepped is not None:
-                    self.log.append(f"{self.name}: {leg.symbol} step-lock "
-                                    f"{stepped:.2f} -> {leg.sl:.2f} "
-                                    f"({leg.steps_locked} x {NAKED_STEP_PCT:g}% decay)")
-                    if self.notify:
-                        discord(f"**{self.name}** — profit lock\n"
-                                f"`{now:%H:%M}`  `{leg.symbol}`\n"
-                                f"SL {stepped:.2f} → **{leg.sl:.2f}**  "
-                                f"({leg.steps_locked} × {NAKED_STEP_PCT:g}% decay)",
-                                tag="🔒")
-                moved = self.trail_naked_sl(leg, day, now)
-                if moved is not None:
-                    src = "Supertrend" if self.naked_mode == "ST_TRAIL" else "21 EMA"
-                    self.log.append(f"{self.name}: {leg.symbol} trail SL "
-                                    f"{moved:.2f} -> {leg.sl:.2f} ({src})")
-
-        for leg in list(self.state.open_legs):
-            fill = self.sl_fill(leg, day, now)
-            if fill is not None and not leg.naked:
-                self.exit_leg(leg, fill, "SL_HIT", now, i)
-                p = self.partner(leg)
-                if p:
-                    p.naked = True; p.naked_since = i
-                    # Re-base the survivor's stop to 1.3x its CURRENT premium.
-                    # Leaving it at 1.3x the original entry would mean almost
-                    # no stop at all once the premium has decayed.
-                    ltp = self.leg_ltp(day, p, now)
-                    old_sl = p.sl
-                    if NAKED_REBASE_ON_PARTNER_SL:
-                        p.sl = ltp * self.naked_mult
-                    p.base_sl = p.sl
-                    self.log.append(f"{self.name}: {p.symbol} now naked · "
-                                    f"SL re-based {old_sl:.2f} -> {p.sl:.2f} "
-                                    f"(LTP {ltp:.2f} x {self.naked_mult})")
-                    if self.notify:
-                        discord(f"**{self.name}** — leg now naked\n"
-                                f"`{now:%H:%M}`  `{p.symbol}`  entry {p.entry_price:.2f}\n"
-                                f"SL re-based {old_sl:.2f} → **{p.sl:.2f}** "
-                                f"(LTP {ltp:.2f} × {self.naked_mult})\n"
-                                f"now trailing the 21 EMA", tag="⚠️")
-                if self.redeploy_mode == REDEPLOY_IMMEDIATE \
-                        and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
-                    self.deploy(day, spot, fut, now, i)
-                continue
-            if leg.naked:
-                if fill is not None:
-                    self.exit_leg(leg, fill, "NAKED_SL_HIT", now, i)
-                    continue
-                if self.naked_cross_exit(leg, day, now):
-                    _, df = self.option_df(day, leg.strike, leg.opt_type)
-                    r = df[df.ts == now]
-                    self.exit_leg(leg,
-                                  float(r.close.iloc[0]) if not r.empty else leg.entry_price,
-                                  "NAKED_EMA_CROSS", now, i)
-                    continue
-
-        if not self.state.open_legs and self.state.straddle_count < MAX_STRADDLES_PER_DAY:
-            if self.entry_ok(nifty.iloc[: i+1], self._vix, i, now):
-                self.deploy(day, spot, fut, now, i)
-
-    def prepare(self, day):
-        """Reset for a fresh session. Used by the threaded live engine, which
-        then feeds bars in one at a time rather than replaying the day."""
-        self.state = DayState()
-        self.heartbeat = []
-        self.log = []
-        self._prev_trend = None
-        self._logged = set()
-        self.last_ts = None
-        self._resume_mark = None
-        self._entry_diag = {}
-
-    def leg_ltp(self, day, leg, now):
-        _, df = self.option_df(day, leg.strike, leg.opt_type)
-        r = df[df.ts <= now] if not df.empty else pd.DataFrame()
-        return float(r.close.iloc[-1]) if not r.empty else leg.entry_price
-
-    def unrealised(self, day, now):
-        return sum((l.entry_price - self.leg_ltp(day, l, now)) * l.qty
-                   for l in self.state.open_legs)
-
-    def status_rows(self, day, now, stamp):
-        """Sheet 1 — the whole day's leg ledger, open and closed, leg-wise P&L."""
-        rows = []
-        for l in self.state.open_legs:
-            ltp = self.leg_ltp(day, l, now)
-            rows.append([stamp, str(day), self.name, "OPEN", l.straddle_num,
-                         l.symbol, l.opt_type, l.strike, l.qty,
-                         l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
-                         round(l.sl, 2), round(ltp, 2), "", "", "",
-                         round((l.entry_price - ltp) * l.qty, 2),
-                         l.naked, l.sl_tightened, l.carry_bars])
-        for l in self.state.closed_legs:
-            pnl = (l.entry_price - l.exit_price) * l.qty if l.exit_price is not None else 0
-            rows.append([stamp, str(day), self.name, "CLOSED", l.straddle_num,
-                         l.symbol, l.opt_type, l.strike, l.qty,
-                         l.entry_time.strftime("%H:%M:%S"), round(l.entry_price, 2),
-                         round(l.sl, 2), "",
-                         l.exit_time.strftime("%H:%M:%S") if l.exit_time else "",
-                         round(l.exit_price, 2) if l.exit_price is not None else "",
-                         l.exit_reason or "", round(pnl, 2),
-                         l.naked, l.sl_tightened, l.carry_bars])
-        return rows
-
-    def log_row(self, day, now, spot, stamp):
-        """Sheet 2 — one row per strategy per 3-minute bar."""
-        detail = []
-        for l in self.state.open_legs:
-            ltp = self.leg_ltp(day, l, now)
-            detail.append(f"{l.opt_type}{l.strike} E{l.entry_price:.1f} "
-                          f"L{ltp:.1f} SL{l.sl:.1f}" + (" NAKED" if l.naked else ""))
-        real = self.state.pnl()
-        unreal = self.unrealised(day, now)
-        d = self._entry_diag or {}
-        return [now.strftime("%Y-%m-%d %H:%M:%S"), stamp, str(day), self.name,
-                round(spot, 2),
-                self._prev_trend or "NONE", self.state.straddle_count,
-                len(self.state.open_legs), len(self.state.closed_legs),
-                round(real, 2), round(unreal, 2), round(real + unreal, 2),
-                " | ".join(detail) if detail else "flat",
-                _j(d.get("adx")), _j(d.get("adxr")),
-                _j(d.get("adx_fall")), _j(d.get("adxr_fall")),
-                _j(d.get("vix")), _j(d.get("vix_age_min")),
-                _j(d.get("ok")), d.get("why", "")]
-
-    def new_trade_rows(self, day):
-        """Sheet 3 — appended once per leg, when it closes."""
-        rows = []
-        for l in self.state.closed_legs:
-            k = f"{l.symbol}|{l.entry_time}|{l.exit_time}"
-            if k in self._logged:
-                continue
-            self._logged.add(k)
-            pnl = (l.entry_price - l.exit_price) * l.qty if l.exit_price is not None else 0
-            rows.append([str(day), self.name, l.straddle_num, l.symbol, l.opt_type,
-                         l.strike, l.qty, l.entry_time.strftime("%H:%M:%S"),
-                         round(l.entry_price, 2), round(l.sl, 2),
-                         l.exit_time.strftime("%H:%M:%S") if l.exit_time else "",
-                         round(l.exit_price, 2) if l.exit_price is not None else "",
-                         l.exit_reason or "", round(pnl, 2),
-                         l.naked, l.sl_tightened, l.carry_bars])
-        return rows
-
-    def resume_from(self, day, status_df):
-        """Rebuild state from Sheet 1 after a restart. Restores BOTH open and
-        closed legs, so realised P&L and the straddle count survive. Restoring
-        only open legs would understate P&L and could allow an extra straddle."""
-        if status_df.empty or "strategy" not in status_df.columns:
-            return 0, 0
-        d = status_df[(status_df.strategy == self.name)
-                      & (status_df.trading_date.astype(str) == str(day))]
-        if d.empty:
-            return 0, 0
-
-        def as_bool(v):
-            return str(v).strip().upper() in ("TRUE", "1", "YES")
-
-        def num(v, cast=float, default=None):
-            try:
-                if v == "" or pd.isna(v):
-                    return default
-                return cast(float(v))
-            except Exception:
-                return default
-
-        opened = closed = 0
-        for _, r in d.iterrows():
-            try:
-                t = dt.datetime.strptime(str(r.entry_time), "%H:%M:%S").time()
-                et = dt.datetime.combine(day, t)
-            except Exception:
-                et = dt.datetime.combine(day, MARKET_OPEN)
-            leg = Leg(symbol=str(r.leg_symbol), opt_type=str(r.opt_type),
-                      strike=int(num(r.strike, int, 0)),
-                      entry_price=num(r.entry_price, float, 0.0),
-                      sl=num(r.sl, float, 0.0),
-                      qty=int(num(r.qty, int, LOT_SIZE)),
-                      entry_time=et, entry_idx=0,
-                      straddle_num=int(num(r.straddle_num, int, 1)),
-                      naked=as_bool(r.naked), sl_tightened=as_bool(r.sl_tightened))
-            if str(r.status).upper() == "CLOSED":
-                leg.exit_price = num(r.exit_price, float, leg.entry_price)
-                leg.exit_reason = str(r.exit_reason) or "RESUMED"
-                try:
-                    xt = dt.datetime.strptime(str(r.exit_time), "%H:%M:%S").time()
-                    leg.exit_time = dt.datetime.combine(day, xt)
-                except Exception:
-                    leg.exit_time = et
-                self.state.closed_legs.append(leg)
-                self._logged.add(f"{leg.symbol}|{leg.entry_time}|{leg.exit_time}")
-                closed += 1
-            else:
-                self.state.open_legs.append(leg)
-                opened += 1
-
-        nums = [l.straddle_num for l in self.state.open_legs + self.state.closed_legs]
-        if nums:
-            self.state.straddle_count = max(nums)
-
-        # Newest known activity. Used only if Log_<date> is unavailable, to
-        # stop the engine replaying the morning over a resumed position.
-        stamps = [l.entry_time for l in self.state.open_legs + self.state.closed_legs]
-        stamps += [l.exit_time for l in self.state.closed_legs if l.exit_time]
-        self._resume_mark = max(stamps) if stamps else None
-        return opened, closed
-
-    def run_day(self, day, nifty, vix, fut, finalize=True):
-        self.state = DayState(); self.heartbeat = []; self.log = []; self._prev_trend = None
-        self._vix = vix
-        mask = nifty.ts.dt.date == day
-        pos = np.flatnonzero(mask.to_numpy())
-        if len(pos) == 0:
-            return
-        dayc = nifty.loc[mask].reset_index(drop=True)
-        for li in range(len(dayc)):
-            i = int(pos[li]); now = dayc.ts.iloc[li]
-            spot = float(dayc.close.iloc[li])
-            fr = fut[fut.ts <= now] if ("ts" in fut.columns and not fut.empty) \
-                else empty_candles()
-            self.on_bar(day, nifty, i, li, now,
-                        spot, float(fr.close.iloc[-1]) if not fr.empty else spot)
-        # Only force-close when the session is actually over. On a mid-session
-        # run these legs are still live — booking them at entry price would
-        # invent zero-P&L exits that never happened.
-        if finalize:
-            for leg in list(self.state.open_legs):
-                self.exit_leg(leg, leg.entry_price, "FORCED_DAY_END",
-                              dayc.ts.iloc[-1], int(pos[-1]))
-
-
-# ============================== RUN ==========================================
-def run_dates(dates, run_type, variants, expiry_override=None,
-              finalize=True, progress=None):
-    """Backtest driver. Returns the same three shapes the live engine writes:
-    trade rows, a per-day-per-strategy summary, heartbeat, and open legs."""
-    smart = angel_login()
-    lookup, expiries = option_universe()
-    first, last = min(dates), max(dates)
-    frm = dt.datetime.combine(first-dt.timedelta(days=WARMUP_CALENDAR_DAYS), dt.time(9, 15))
-    to = min(dt.datetime.combine(last, dt.time(15, 30)), now_ist())
-
-    nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, to)
-    vix = candles(smart, INDIA_VIX_TOKEN, NSE, frm, to)
-    fut = candles(smart, NIFTY_FUT_TOKEN, NFO, frm, to)
-    if nifty.empty:
-        return None, None, None, "No NIFTY candles returned."
-
-    warm = int((nifty.ts.dt.date < first).sum())
-    notes = []
-    if vix.empty:
-        notes.append("India VIX returned no candles — the VIX entry filter cannot "
-                     "pass, so no trades will be taken.")
-    if fut.empty:
-        notes.append("NIFTY futures returned no candles — Monday strike selection "
-                     "falls back to spot. Check NIFTY_FUT_TOKEN after each roll.")
-    if warm < FULL_WARMUP_BARS:
-        notes.append(f"Only {warm} warm-up bars (want {FULL_WARMUP_BARS}); the Loxx "
-                     "squeeze filter is skipped early in the day.")
-
-    trades, summary, hb, logs, open_legs = [], [], [], [], []
-    cache = {}
-    for n, day in enumerate(sorted(dates)):
-        expiry = expiry_override or nearest_expiry(expiries, day)
-        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache,
-                                  naked_mode=nk, sl_mult=sm, naked_mult=km)
-                   for nm, dyn, rd, ml, nk, sm, km in variants]
-        for e in engines:
-            e.run_day(day, nifty, vix, fut, finalize=finalize)
-            trades += e.new_trade_rows(day)
-            summary.append([run_type, e.name, str(day), round(e.state.pnl(), 2),
-                            len(e.state.closed_legs), e.state.straddle_count,
-                            sum(1 for l in e.state.closed_legs if l.naked),
-                            sum(1 for l in e.state.closed_legs
-                                if l.exit_reason == "NAKED_SL_HIT"),
-                            e.state.redeploys])
-            for l in e.state.open_legs:
-                open_legs.append([e.name, l.straddle_num, l.symbol, l.opt_type,
-                                  l.strike, l.entry_time.strftime("%H:%M:%S"),
-                                  round(l.entry_price, 2), round(l.sl, 2),
-                                  l.naked, l.sl_tightened])
-            hb += e.heartbeat
-            logs += e.log
-        if progress:
-            progress.progress((n+1)/len(dates), text=f"{day} ({n+1}/{len(dates)})")
-
-    O = pd.DataFrame(open_legs, columns=["strategy", "straddle_num", "leg_symbol",
-                                         "opt_type", "strike", "entry_time",
-                                         "entry_price", "sl", "naked", "sl_tightened"])
-    return (pd.DataFrame(trades, columns=TRADE_HEADERS),
-            pd.DataFrame(summary, columns=SUMMARY_HEADERS),
-            pd.DataFrame(hb, columns=HEARTBEAT_HEADERS), O), logs, notes, None
-
-
-# ============================== UI ===========================================
-# ============================== THREADED LIVE ENGINE ========================
-def _seconds_to_next_bar(now):
-    """Sleep target: the next 3-minute boundary plus a buffer, so the bar has
-    actually closed broker-side before we ask for it."""
-    secs = (CANDLE_MIN - (now.minute % CANDLE_MIN)) * 60 - now.second
-    if secs <= 0:
-        secs = CANDLE_MIN * 60
-    return secs + POLL_BUFFER_SEC
-
-
-TUNABLES = ["SL_MULTIPLIER", "TIGHT_SL_MULTIPLIER", "SL_FILL_AT_STOP",
-            "SL_SLIPPAGE_PTS", "NAKED_TRAIL_TRIGGER", "NAKED_TRAIL_BUFFER_PCT",
-            "NAKED_REBASE_ON_PARTNER_SL", "NAKED_STEP_ENABLED", "NAKED_STEP_PCT",
-            "NAKED_STEP_SL_PCT", "ST_PERIOD", "ST_MULT"]
-
-
-def snapshot_tunables():
-    return {k: globals()[k] for k in TUNABLES}
-
-
-def apply_tunables(cfg):
-    """Re-assert the engine's settings on the module globals.
-
-    Streamlit re-executes this file on every rerun, which resets each constant
-    to its file default. The sidebar normally re-applies the chosen values, but
-    it is locked while the engine runs — so without this the engine would
-    silently revert to defaults mid-session and stop matching the backtest.
-    """
-    if cfg:
-        globals().update(cfg)
-
-
-def live_engine_loop(stop_event, expiry, status, notify_on=False, cfg=None):
-    """Daemon thread. Wakes just after each 3-minute close, feeds unseen bars
-    into every engine, then writes the three sheets:
-
-      Sheet 1  Live_Status        rewritten whole — current leg ledger
-      Sheet 2  Log_<date>         appended — one row per strategy per bar
-      Sheet 3  Trades_<date>      appended — one row per leg on close
-
-    On startup it reads Sheet 1 and resumes that day's state, so a container
-    restart continues rather than beginning flat.
-    """
-    day = today_ist()
-    cfg = cfg or snapshot_tunables()
-    apply_tunables(cfg)
-    status["state"] = "starting"
-    status["log"] = []
-    status["cfg"] = cfg
-
-    def note(msg):
-        status["log"] = (status.get("log", []) + [f"{now_ist():%H:%M:%S}  {msg}"])[-60:]
-
-    try:
-        smart = angel_login()
-        lookup, _ = option_universe()
-        cache = {}
-        engines = [StraddleEngine(nm, dyn, rd, ml, smart, lookup, expiry, cache,
-                                  naked_mode=nk, sl_mult=sm, naked_mult=km)
-                   for nm, dyn, rd, ml, nk, sm, km in VARIANTS_LIVE]
-
-        try:
-            prev = read_tab("LIVE", TAB_STATUS)
-        except Exception as e:
-            prev = pd.DataFrame()
-            note(f"could not read {TAB_STATUS}: {e}")
-
-        # Sheet 1 accumulates. Previous days are held in memory and rewritten
-        # ahead of today's rows each cycle, so history is preserved while
-        # today's block stays current. Read once here rather than every cycle.
-        carry_rows = []
-        if not prev.empty and "trading_date" in prev.columns:
-            older = prev[prev.trading_date.astype(str) != str(day)]
-            carry_rows = rows_from_df(older, STATUS_HEADERS)
-            if carry_rows:
-                note(f"{TAB_STATUS}: carrying {len(carry_rows)} row(s) "
-                     f"from {older.trading_date.nunique()} earlier day(s)")
-
-        resumed_open = resumed_closed = 0
-        for e in engines:
-            e.prepare(day)
-            e.notify = notify_on
-            o, c = e.resume_from(day, prev)
-            resumed_open += o
-            resumed_closed += c
-
-        # Where to resume from. Without this, last_ts stays None and the first
-        # cycle treats every bar since 09:15 as new — replaying the whole
-        # morning against the position we just restored.
-        resume_ts = None
-        try:
-            lg = read_tab("LIVE", tab_log(day))
-            if not lg.empty and "bar_time" in lg.columns:
-                bt = pd.to_datetime(lg["bar_time"], errors="coerce").dropna()
-                if len(bt):
-                    resume_ts = bt.max().to_pydatetime()
-                    note(f"{tab_log(day)}: last bar processed {resume_ts:%H:%M}")
-        except Exception as e:
-            note(f"could not read {tab_log(day)}: {e}")
-
-        if resume_ts is None:
-            marks = [m_ for m_ in (getattr(e, "_resume_mark", None) for e in engines)
-                     if m_]
-            if marks:
-                resume_ts = max(marks)
-                note(f"no log tab — resuming from newest leg activity "
-                     f"{resume_ts:%H:%M}")
-
-        msg = f"engine up · expiry {expiry} · {len(engines)} variants"
-        if resumed_open or resumed_closed:
-            msg += f" · resumed {resumed_open} open / {resumed_closed} closed legs"
-        if resume_ts:
-            msg += f" · continuing after {resume_ts:%H:%M}"
-        note(msg)
-        if notify_on:
-            discord(f"**Straddle Desk started**\n`{day}`  expiry `{expiry}`\n"
-                    f"resumed: {resumed_open} open, {resumed_closed} closed\n"
-                    f"continuing after: "
-                    f"{resume_ts.strftime('%H:%M') if resume_ts else 'session start'}\n"
-                    f"variants: {', '.join(e.name for e in engines)}", tag="🚀")
-    except Exception as e:
-        status["state"] = "failed"
-        note(f"startup failed: {type(e).__name__}: {e}")
-        if notify_on:
-            discord(f"**Startup failed**\n`{type(e).__name__}: {e}`", tag="❌")
-        return
-
-    # Seed VIX from the warm-up window so the first hour is covered even if
-    # today's bars have not published yet.
-    vix = empty_candles()
-    vix_carried = 0
-    try:
-        seed_from = dt.datetime.combine(day - dt.timedelta(days=WARMUP_CALENDAR_DAYS),
-                                        MARKET_OPEN)
-        vix = candles(smart, INDIA_VIX_TOKEN, NSE, seed_from, now_ist())
-        if vix.empty:
-            note("VIX seed empty at startup — entries blocked until it publishes")
-        else:
-            note(f"VIX seeded: {len(vix)} bars, last {float(vix.close.iloc[-1]):.2f} "
-                 f"at {vix.ts.iloc[-1]:%d %b %H:%M}")
-    except Exception as e:
-        note(f"VIX seed failed: {e}")
-
-    status["state"] = "running"
-    last_ts = resume_ts        # None only on a genuinely fresh start
-
-    while not stop_event.is_set():
-        now = now_ist()
-        if now.time() < MARKET_OPEN:
-            time.sleep(20)
-            continue
-        if now.time() >= MARKET_CLOSE:
-            note("market closed — finalising")
-            break
-
-        target = now + dt.timedelta(seconds=_seconds_to_next_bar(now))
-        while now_ist() < target:
-            if stop_event.is_set():
-                note("stopped from the dashboard")
-                if notify_on:
-                    discord("**Engine stopped from the dashboard**", tag="🛑")
-                break
-            time.sleep(1)
-        if stop_event.is_set():
-            break                    # fall through to finalisation, not return
-
-        try:
-            apply_tunables(cfg)          # survive Streamlit reruns
-            now = now_ist()
-            frm = dt.datetime.combine(day - dt.timedelta(days=WARMUP_CALENDAR_DAYS),
-                                      MARKET_OPEN)
-            nifty = candles(smart, NIFTY_INDEX_TOKEN, NSE, frm, now)
-            if nifty.empty:
-                note("no NIFTY candles — retrying next cycle")
-                continue
-            vix_new = candles(smart, INDIA_VIX_TOKEN, NSE, frm, now)
-            fut = candles(smart, NIFTY_FUT_TOKEN, NFO, frm, now)
-            # India VIX is published late and intermittently on the historical
-            # endpoint. An empty fetch used to block entry outright — on
-            # 18 Sep that cost the 10:24 bar and the whole day diverged from
-            # the backtest. Keep the last good series and reuse it.
-            if not vix_new.empty:
-                vix = vix_new
-                vix_carried = 0
-            else:
-                vix_carried += 1
-                note(f"VIX fetch empty — carrying last good series "
-                     f"({vix_carried} cycle(s), "
-                     f"{'usable' if not vix.empty else 'NONE YET'})")
-            if fut.empty:
-                note("futures empty this cycle — using spot for strikes")
-
-            mask = nifty.ts.dt.date == day
-            pos = np.flatnonzero(mask.to_numpy())
-            if len(pos) < 2:
-                note("waiting for the session to produce bars")
-                continue
-
-            pos = pos[:-1]                       # drop the forming candle
-            new_bars = [p for p in pos if last_ts is None or nifty.ts.iloc[p] > last_ts]
-
-            # Option prices must be fresh each cycle, so the shared candle
-            # cache is dropped before evaluating.
-            cache.clear()
-
-            spot = float(nifty.close.iloc[int(pos[-1])])
-            if new_bars:
-                for p in new_bars:
-                    i = int(p)
-                    bar_ts = nifty.ts.iloc[i]
-                    spot = float(nifty.close.iloc[i])
-                    fr = fut[fut.ts <= bar_ts] if ("ts" in fut.columns and not fut.empty) \
-                        else empty_candles()
-                    fv = float(fr.close.iloc[-1]) if not fr.empty else spot
-                    for e in engines:
-                        e._vix = vix
-                        e.on_bar(day, nifty, i, None, bar_ts, spot, fv)
-                    last_ts = bar_ts
-                note(f"processed to {last_ts:%H:%M}")
-            else:
-                note("no new completed bar yet")
-
-            stamp = now.strftime("%Y-%m-%d %H:%M:%S")
-            mark = last_ts if last_ts is not None else nifty.ts.iloc[int(pos[-1])]
-
-            # Sheet 3 — closed legs, appended once each
-            wrote = 0
-            for e in engines:
-                rows = e.new_trade_rows(day)
-                if rows:
-                    wrote += append_rows("LIVE", tab_trades(day), TRADE_HEADERS, rows)
-            if wrote:
-                note(f"{wrote} leg(s) -> {tab_trades(day)}")
-
-            # Sheet 2 — 3-minute log
-            append_rows("LIVE", tab_log(day), LOG_HEADERS,
-                        [e.log_row(day, mark, spot, stamp) for e in engines])
-
-            # Sheet 1 — running ledger: earlier days kept, today refreshed.
-            # `updated_at` on these rows doubles as the engine's heartbeat: the
-            # Start button reads it to detect an engine already running in a
-            # different container, which the in-process registry cannot see.
-            today_rows = [r for e in engines for r in e.status_rows(day, mark, stamp)]
-            if not today_rows:
-                # flat and nothing closed yet — still stamp a heartbeat row
-                today_rows = [[stamp, str(day), e.name, "FLAT", 0, "", "", "", 0,
-                               "", "", "", "", "", "", "", 0, False, False, 0]
-                              for e in engines]
-            replace_tab("LIVE", TAB_STATUS, STATUS_HEADERS, carry_rows + today_rows)
-
-            status["summary"] = {
-                e.name: dict(realised=round(e.state.pnl(), 2),
-                             unrealised=round(e.unrealised(day, mark), 2),
-                             total=round(e.state.pnl() + e.unrealised(day, mark), 2),
-                             closed=len(e.state.closed_legs),
-                             open=len(e.state.open_legs),
-                             straddles=e.state.straddle_count)
-                for e in engines}
-            status["last_bar"] = f"{mark:%H:%M}"
-            status["spot"] = round(spot, 2)
-        except Exception as e:
-            note(f"cycle error: {type(e).__name__}: {e}")
-            time.sleep(5)
-
-    # ---- finalisation: runs on market close AND on a manual stop ----
-    try:
-        now = now_ist()
-        stamp = now.strftime("%Y-%m-%d %H:%M:%S")
-        mark = last_ts if last_ts is not None else now
-        wrote = 0
-        for e in engines:
-            rows = e.new_trade_rows(day)
-            if rows:
-                wrote += append_rows("LIVE", tab_trades(day), TRADE_HEADERS, rows)
-            if e.heartbeat:
-                append_rows("LIVE", f"Heartbeat_{day}", HEARTBEAT_HEADERS, e.heartbeat)
-        replace_tab("LIVE", TAB_STATUS, STATUS_HEADERS,
-                    carry_rows
-                    + [r for e in engines for r in e.status_rows(day, mark, stamp)])
-        note(f"finalised · {wrote} late leg(s) written · "
-             f"{len(carry_rows)} earlier row(s) preserved")
-        status["state"] = "stopped" if stop_event.is_set() else "finished"
-        if notify_on:
-            lines = [f"**{e.name}**  realised {e.state.pnl():+,.0f}  "
-                     f"({len(e.state.closed_legs)} closed, "
-                     f"{len(e.state.open_legs)} open)" for e in engines]
-            discord(f"**Session ended** `{day}`\n" + "\n".join(lines), tag="🏁")
-    except Exception as e:
-        note(f"final write failed: {type(e).__name__}: {e}")
-        status["state"] = "finished_with_errors"
-
-
-# ============================== THEME + HELPERS =============================
-CSS = """
+    HAS_GSPREAD = True
+except ImportError:
+    HAS_GSPREAD = False
+
+# ── Page Config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Super App Nifty",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Universal Light Theme & Straddle Desk UI Styling ───────────────────────
+st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-.stApp { background:
-   radial-gradient(1100px 500px at 12% -8%, #ffe9f4 0%, transparent 60%),
-   radial-gradient(900px 460px at 92% 4%, #e9edff 0%, transparent 58%),
-   #f7f5fb; }
-html, body, [class*="css"], .stMarkdown, p, div, span, label
-   { font-family:'Plus Jakarta Sans',sans-serif; }
-#MainMenu, footer { visibility:hidden; }
-header[data-testid="stHeader"] { background:transparent; height:0; }
+/* Force typography on every element */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
 
-/* The sidebar is pinned open. Hiding the header also hid Streamlit's expand
-   arrow, so a stray click on collapse left no way back — the collapse control
-   is removed instead and the panel forced visible. */
+html, body, [class*="css"], .stMarkdown, p, div, span, label, input, button, textarea, select {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
+}
+
+/* Base Light Backdrop */
+.stApp {
+  background:
+    radial-gradient(1100px 500px at 12% -8%, #ffe9f4 0%, transparent 60%),
+    radial-gradient(900px 460px at 92% 4%, #e9edff 0%, transparent 58%),
+    #f7f5fb !important;
+  color: #1e1035 !important;
+}
+
+#MainMenu, footer { visibility: hidden; }
+header[data-testid="stHeader"] { background: transparent; height: 0; }
+
+/* Keep sidebar pinned */
 [data-testid="stSidebarCollapseButton"],
 [data-testid="collapsedControl"],
-button[kind="header"] { display:none !important; }
+button[kind="header"] { display: none !important; }
 
+/* ── SIDEBAR (Deep Purple Gradient) ─────────────────────────────────────── */
 section[data-testid="stSidebar"] {
-  visibility:visible !important;
-  transform:none !important;
-  margin-left:0 !important;
-  min-width:290px !important;
-  width:290px !important; }
-section[data-testid="stSidebar"][aria-expanded="false"] {
-  visibility:visible !important; transform:none !important; }
-
-/* On a phone a pinned 290px panel would swallow the screen, so let it behave
-   normally there and restore the expand control. */
-@media (max-width:640px) {
-  section[data-testid="stSidebar"] { min-width:0 !important; width:auto !important; }
-  [data-testid="stSidebarCollapseButton"],
-  [data-testid="collapsedControl"] { display:block !important; }
+  visibility: visible !important;
+  transform: none !important;
+  margin-left: 0 !important;
+  min-width: 290px !important;
+  width: 290px !important;
+  background: linear-gradient(180deg, #1c1030 0%, #2a1246 55%, #33144f 100%) !important;
+  border-right: none !important;
 }
-.block-container { padding:1rem 2rem 3rem; max-width:1480px; }
+section[data-testid="stSidebar"] * {
+  color: #ede7f6 !important;
+}
+section[data-testid="stSidebar"] .block-container {
+  padding-top: 1.6rem;
+}
 
-/* ---------- sidebar ---------- */
-section[data-testid="stSidebar"] {
-  background:linear-gradient(180deg,#1c1030 0%,#2a1246 55%,#33144f 100%);
-  border-right:none; }
-section[data-testid="stSidebar"] * { color:#ede7f6; }
-section[data-testid="stSidebar"] .block-container { padding-top:1.6rem; }
-.brand { font-size:1.12rem; font-weight:800; letter-spacing:-.02em; color:#fff;
-  display:flex; align-items:center; gap:.5rem; margin:0 0 .25rem 0; }
-.brand-dot { width:9px; height:9px; border-radius:50%;
-  background:linear-gradient(135deg,#f472b6,#a78bfa);
-  box-shadow:0 0 12px rgba(244,114,182,.85); }
-.brand-sub { font-size:.72rem; color:#b9a8d4; margin-bottom:1.5rem;
-  letter-spacing:.04em; text-transform:uppercase; font-weight:600; }
+.brand {
+  font-size: 1.15rem; font-weight: 800; letter-spacing: -0.02em; color: #ffffff !important;
+  display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.25rem 0;
+}
+.brand-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: linear-gradient(135deg, #f472b6, #a78bfa);
+  box-shadow: 0 0 12px rgba(244, 114, 182, 0.85);
+}
+.brand-sub {
+  font-size: 0.72rem; color: #b9a8d4 !important; margin-bottom: 1.5rem;
+  letter-spacing: 0.04em; text-transform: uppercase; font-weight: 600;
+}
 
-/* nav: turn the radio group into nav rows */
-section[data-testid="stSidebar"] div[role="radiogroup"] { gap:.3rem; }
+/* Sidebar Radio Navigation Rows */
+section[data-testid="stSidebar"] div[role="radiogroup"] {
+  gap: 0.35rem;
+}
 section[data-testid="stSidebar"] div[role="radiogroup"] > label {
-  background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.06);
-  border-radius:11px; padding:.6rem .85rem; width:100%; cursor:pointer;
-  transition:all .16s ease; font-weight:600; font-size:.9rem; }
+  background: rgba(255, 255, 255, 0.04) !important;
+  border: 1px solid rgba(255, 255, 255, 0.07) !important;
+  border-radius: 11px !important; padding: 0.65rem 0.9rem !important;
+  width: 100% !important; cursor: pointer !important;
+  transition: all 0.16s ease !important; font-weight: 600 !important; font-size: 0.9rem !important;
+}
 section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
-  background:rgba(255,255,255,.11); transform:translateX(2px); }
-section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child
-  { display:none; }
+  background: rgba(255, 255, 255, 0.12) !important; transform: translateX(2px);
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child {
+  display: none !important;
+}
 section[data-testid="stSidebar"] div[role="radiogroup"] > label[data-checked="true"],
 section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {
-  background:linear-gradient(135deg,#ec4899,#a855f7);
-  border-color:transparent; box-shadow:0 6px 18px rgba(168,85,247,.35); }
-.side-sep { height:1px; background:rgba(255,255,255,.09); margin:1.3rem 0 1rem; }
-.side-lbl { font-size:.66rem; text-transform:uppercase; letter-spacing:.09em;
-  color:#a692c4; font-weight:700; margin-bottom:.5rem; }
-.side-kv { display:flex; justify-content:space-between; font-size:.76rem;
-  padding:.3rem 0; color:#cfc2e4; }
-.side-kv b { color:#fff; font-weight:600; }
-
-/* ---------- header ---------- */
-.hdr { display:flex; align-items:flex-end; justify-content:space-between;
-  margin:.2rem 0 1.4rem; flex-wrap:wrap; gap:.8rem; }
-.hdr h1 { font-size:1.85rem; font-weight:800; letter-spacing:-.03em; margin:0;
-  background:linear-gradient(120deg,#1e1035 20%,#7c3aed 60%,#ec4899 95%);
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-.hdr .tag { font-size:.85rem; color:#7c6f8c; margin-top:.15rem; font-weight:500; }
-.chip { display:inline-flex; align-items:center; gap:.4rem; padding:.42rem .85rem;
-  border-radius:99px; font-size:.76rem; font-weight:700; background:#fff;
-  border:1px solid #ece3f5; box-shadow:0 2px 8px rgba(80,20,120,.06); }
-.chip .dot { width:7px; height:7px; border-radius:50%; }
-.dot-live { background:#22c55e; box-shadow:0 0 9px #22c55e; }
-.dot-off  { background:#cbd5e1; }
-
-/* ---------- panels ---------- */
-.panel { background:rgba(255,255,255,.82); backdrop-filter:blur(6px);
-  border-radius:20px; padding:1.25rem 1.4rem; border:1px solid rgba(255,255,255,.9);
-  box-shadow:0 8px 26px rgba(80,20,120,.07); margin-bottom:1.1rem; }
-.panel h4 { margin:0; font-size:1.02rem; font-weight:700; color:#1e1035;
-  letter-spacing:-.01em; }
-.panel .sub { font-size:.79rem; color:#8b7d9c; margin-top:.2rem; font-weight:500; }
-
-/* ---------- kpi ---------- */
-.kpi-grid { display:grid; gap:.85rem; margin-bottom:1.1rem;
-  grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); }
-@media (max-width:900px) {
-  .kpi-grid { grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); }
+  background: linear-gradient(135deg, #ec4899, #a855f7) !important;
+  border-color: transparent !important; color: #ffffff !important; font-weight: 700 !important;
+  box-shadow: 0 6px 18px rgba(168, 85, 247, 0.35) !important;
 }
-.kpi { border-radius:18px; padding:1.05rem 1.15rem; color:#fff; position:relative;
-  overflow:hidden; box-shadow:0 8px 22px rgba(90,25,120,.20);
-  transition:transform .18s ease; min-width:0; }
-.kpi:hover { transform:translateY(-3px); }
-.kpi:after { content:""; position:absolute; right:-30px; top:-30px; width:88px;
-  height:88px; border-radius:50%; background:rgba(255,255,255,.12); }
-.kpi .lbl { font-size:.66rem; text-transform:uppercase; letter-spacing:.06em;
-  font-weight:700; opacity:.92; white-space:nowrap; overflow:hidden;
-  text-overflow:ellipsis; }
-/* clamp so five cards on a tablet never wrap the figure onto two lines */
-.kpi .val { font-size:clamp(1.25rem, 2.1vw, 1.8rem); font-weight:800;
-  letter-spacing:-.03em; line-height:1.2; margin-top:.3rem;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.kpi .fin { font-size:.68rem; opacity:.88; margin-top:.2rem; font-weight:500;
-  white-space:nowrap; }
-.g1 { background:linear-gradient(135deg,#f43f5e,#ec4899 55%,#d946ef); }
-.g2 { background:linear-gradient(135deg,#8b5cf6,#6366f1 60%,#4f46e5); }
-.g3 { background:linear-gradient(135deg,#06b6d4,#0ea5e9 60%,#3b82f6); }
-.g4 { background:linear-gradient(135deg,#f59e0b,#f97316 60%,#ef4444); }
-.g5 { background:linear-gradient(135deg,#10b981,#059669 60%,#047857); }
-.gneg { background:linear-gradient(135deg,#475569,#64748b); }
-.gmute { background:linear-gradient(135deg,#e6e0ee,#efeaf6); color:#7c6f8c;
-  box-shadow:none; border:1px dashed #ddd2ea; }
-.gmute .val { color:#a99bbd; }
 
-/* ---------- stat tile ---------- */
-.stat { background:#fff; border-radius:16px; padding:.95rem 1.1rem;
-  border:1px solid #f0e9f7; box-shadow:0 2px 10px rgba(80,20,120,.045); }
-.stat .lbl { font-size:.68rem; color:#9b8aa6; text-transform:uppercase;
-  letter-spacing:.08em; font-weight:700; }
-.stat .val { font-size:1.32rem; font-weight:800; color:#1e1035;
-  letter-spacing:-.02em; margin-top:.15rem; }
+.side-sep {
+  height: 1px; background: rgba(255, 255, 255, 0.09); margin: 1.3rem 0 1rem;
+}
+.side-lbl {
+  font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.09em;
+  color: #a692c4 !important; font-weight: 700; margin-bottom: 0.5rem;
+}
+.side-kv {
+  display: flex; justify-content: space-between; font-size: 0.78rem;
+  padding: 0.32rem 0; color: #cfc2e4 !important;
+}
+.side-kv b {
+  color: #ffffff !important; font-weight: 700;
+}
 
-/* ---------- empty state ---------- */
-.empty { text-align:center; padding:2.6rem 1rem; color:#9b8aa6; }
-.empty .ico { font-size:2rem; opacity:.5; }
-.empty .t { font-weight:700; color:#5c4d70; margin-top:.5rem; font-size:.98rem; }
-.empty .s { font-size:.82rem; margin-top:.25rem; }
+/* ── MAIN CONTENT AREA & TEXT READABILITY ────────────────────────────────── */
+.block-container {
+  padding: 1rem 2rem 3rem; max-width: 1480px;
+}
 
-/* ---------- widgets ---------- */
-.stButton>button { border-radius:13px; font-weight:700; border:none; width:100%;
-  background:linear-gradient(135deg,#ec4899,#a855f7); color:#fff;
-  padding:.62rem 1.2rem; letter-spacing:.01em;
-  box-shadow:0 6px 18px rgba(168,85,247,.32); transition:all .16s ease; }
-.stButton>button:hover { transform:translateY(-2px); color:#fff;
-  box-shadow:0 10px 24px rgba(168,85,247,.42); }
-div[data-testid="stDataFrame"] { border-radius:14px; overflow:hidden;
-  border:1px solid #efe6f6; box-shadow:0 3px 14px rgba(80,20,120,.05); }
-div[data-baseweb="select"]>div, div[data-testid="stDateInput"] input {
-  border-radius:11px !important; border-color:#eadff5 !important; }
-.stProgress > div > div > div { background:linear-gradient(90deg,#ec4899,#a855f7); }
+/* Enforce crisp dark text across main container (overriding OS dark theme) */
+section.main {
+  color: #1e1035 !important;
+}
+section.main p,
+section.main span:not(.chip .dot):not(.brand-dot),
+section.main div[data-testid="stMarkdownContainer"] p,
+section.main div[data-testid="stMarkdownContainer"] span,
+section.main div[data-testid="stMarkdownContainer"] div,
+section.main div[data-testid="stMarkdownContainer"] h1,
+section.main div[data-testid="stMarkdownContainer"] h2,
+section.main div[data-testid="stMarkdownContainer"] h3,
+section.main div[data-testid="stMarkdownContainer"] h4 {
+  color: #1e1035 !important;
+}
+
+/* Header Component */
+.hdr {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  margin: 0.2rem 0 1.4rem; flex-wrap: wrap; gap: 0.8rem;
+}
+.hdr h1 {
+  font-size: 1.85rem !important; font-weight: 800 !important; letter-spacing: -0.03em !important; margin: 0 !important;
+  background: linear-gradient(120deg, #1e1035 20%, #7c3aed 60%, #ec4899 95%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.hdr .tag {
+  font-size: 0.85rem !important; color: #7c6f8c !important; margin-top: 0.15rem; font-weight: 500 !important;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.42rem 0.85rem;
+  border-radius: 99px; font-size: 0.76rem; font-weight: 700; background: #ffffff;
+  border: 1px solid #ece3f5; box-shadow: 0 2px 8px rgba(80, 20, 120, 0.06); color: #3f2c56 !important;
+}
+.chip .dot {
+  width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 9px #22c55e;
+}
+
+/* ── CARDS, PANELS, CONTAINERS & FORMS ───────────────────────────────────── */
+.panel {
+  background: rgba(255, 255, 255, 0.85) !important;
+  backdrop-filter: blur(8px) !important;
+  border-radius: 20px !important;
+  padding: 1.25rem 1.4rem !important;
+  border: 1px solid rgba(255, 255, 255, 0.95) !important;
+  box-shadow: 0 8px 26px rgba(80, 20, 120, 0.07) !important;
+  margin-bottom: 1.1rem !important;
+}
+.panel h4 {
+  margin: 0 !important; font-size: 1.05rem !important; font-weight: 800 !important;
+  color: #1e1035 !important; letter-spacing: -0.01em !important;
+}
+.panel .sub {
+  font-size: 0.8rem !important; color: #7c6f8c !important; margin-top: 0.2rem !important; font-weight: 500 !important;
+}
+
+/* Streamlit Forms & Bordered Containers Styled as Glassmorphic Panels */
+div[data-testid="stForm"],
+div[data-testid="stVerticalBlockBorderWrapper"] {
+  background: rgba(255, 255, 255, 0.85) !important;
+  backdrop-filter: blur(8px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.95) !important;
+  border-radius: 20px !important;
+  padding: 1.25rem 1.4rem !important;
+  box-shadow: 0 8px 26px rgba(80, 20, 120, 0.07) !important;
+  margin-bottom: 1.1rem !important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] > div {
+  background: transparent !important;
+  border: none !important;
+}
+
+/* ── WIDGETS: ELIMINATE BLACK BOXES & FORCE CRISP LIGHT INPUTS ──────────── */
+/* Labels */
+label,
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label,
+[data-testid="stWidgetLabel"] span {
+  color: #3f2c56 !important;
+  font-weight: 700 !important;
+  font-size: 0.84rem !important;
+  letter-spacing: -0.01em !important;
+}
+
+/* Number inputs, text inputs, date, time */
+div[data-baseweb="input"],
+div[data-baseweb="base-input"],
+div[data-testid="stTextInput"] input,
+div[data-testid="stNumberInput"] input,
+div[data-testid="stDateInput"] input,
+div[data-testid="stTimeInput"] input {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  color: #1e1035 !important;
+  -webkit-text-fill-color: #1e1035 !important;
+  border: 1px solid #e2d6ed !important;
+  border-radius: 12px !important;
+  box-shadow: 0 2px 8px rgba(80, 20, 120, 0.04) !important;
+  font-weight: 600 !important;
+}
+
+div[data-baseweb="input"] input,
+div[data-baseweb="base-input"] input {
+  background: #ffffff !important;
+  color: #1e1035 !important;
+  -webkit-text-fill-color: #1e1035 !important;
+  border: none !important;
+}
+
+/* Number input stepper container and buttons */
+div[data-testid="stNumberInputContainer"] {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  border: 1px solid #e2d6ed !important;
+  border-radius: 12px !important;
+  box-shadow: 0 2px 8px rgba(80, 20, 120, 0.04) !important;
+  overflow: hidden !important;
+}
+div[data-testid="stNumberInputContainer"] input {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  color: #1e1035 !important;
+  -webkit-text-fill-color: #1e1035 !important;
+  border: none !important;
+  font-weight: 700 !important;
+  font-size: 0.95rem !important;
+}
+div[data-testid="stNumberInputContainer"] button {
+  background-color: #f7f3fb !important;
+  background: #f7f3fb !important;
+  border: none !important;
+  border-left: 1px solid #ebdff5 !important;
+  color: #7c3aed !important;
+  transition: all 0.15s ease !important;
+}
+div[data-testid="stNumberInputContainer"] button:hover {
+  background-color: #ede4f7 !important;
+  background: #ede4f7 !important;
+  color: #ec4899 !important;
+}
+div[data-testid="stNumberInputContainer"] button svg,
+div[data-testid="stNumberInputContainer"] button svg path {
+  fill: #7c3aed !important;
+  stroke: #7c3aed !important;
+  color: #7c3aed !important;
+}
+
+/* Selectbox dropdowns */
+div[data-baseweb="select"] {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  border-radius: 12px !important;
+}
+div[data-baseweb="select"] > div {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  border: 1px solid #e2d6ed !important;
+  border-radius: 12px !important;
+  color: #1e1035 !important;
+  box-shadow: 0 2px 8px rgba(80, 20, 120, 0.04) !important;
+}
+div[data-baseweb="select"] span,
+div[data-baseweb="select"] div {
+  color: #1e1035 !important;
+  -webkit-text-fill-color: #1e1035 !important;
+  font-weight: 600 !important;
+}
+div[data-baseweb="select"] svg {
+  fill: #7c3aed !important;
+}
+
+/* Selectbox options menu popover */
+div[data-baseweb="popover"],
+div[data-baseweb="popover"] > div,
+ul[role="listbox"],
+div[data-baseweb="menu"] {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  border-radius: 14px !important;
+  border: 1px solid #ebdff5 !important;
+  box-shadow: 0 12px 32px rgba(80, 20, 120, 0.14) !important;
+}
+li[role="option"] {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  color: #1e1035 !important;
+  font-weight: 500 !important;
+}
+li[role="option"]:hover,
+li[role="option"][aria-selected="true"] {
+  background-color: #f7edfc !important;
+  background: #f7edfc !important;
+  color: #7c3aed !important;
+  font-weight: 700 !important;
+}
+li[role="option"] * {
+  color: inherit !important;
+  -webkit-text-fill-color: inherit !important;
+}
+
+/* Textarea */
+div[data-baseweb="textarea"],
+div[data-testid="stTextArea"] textarea {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  color: #1e1035 !important;
+  -webkit-text-fill-color: #1e1035 !important;
+  border: 1px solid #e2d6ed !important;
+  border-radius: 12px !important;
+  box-shadow: 0 2px 8px rgba(80, 20, 120, 0.04) !important;
+  font-weight: 500 !important;
+}
+input::placeholder, textarea::placeholder {
+  color: #9f8fb5 !important;
+  -webkit-text-fill-color: #9f8fb5 !important;
+}
+
+/* Popover body */
+div[data-testid="stPopoverBody"] {
+  background: #ffffff !important;
+  border-radius: 16px !important;
+  border: 1px solid #ebdff5 !important;
+  box-shadow: 0 12px 32px rgba(80, 20, 120, 0.15) !important;
+  color: #1e1035 !important;
+  padding: 1.2rem !important;
+}
+div[data-testid="stPopoverBody"] * {
+  color: #1e1035 !important;
+}
+
+/* Alerts / Banners */
+div[data-testid="stAlert"] {
+  border-radius: 14px !important;
+  border: 1px solid #e2d6ed !important;
+  background: #ffffff !important;
+  box-shadow: 0 3px 12px rgba(80, 20, 120, 0.04) !important;
+  color: #1e1035 !important;
+}
+div[data-testid="stAlert"] * {
+  color: #1e1035 !important;
+  font-weight: 600 !important;
+}
+
+/* ── BUTTONS (Gradient Pink-Purple) ─────────────────────────────────────── */
+.stButton > button,
+.stDownloadButton > button {
+  border-radius: 13px !important; font-weight: 700 !important; border: none !important; width: 100% !important;
+  background: linear-gradient(135deg, #ec4899, #a855f7) !important;
+  color: #ffffff !important; padding: 0.65rem 1.2rem !important; letter-spacing: 0.01em !important;
+  box-shadow: 0 6px 18px rgba(168, 85, 247, 0.32) !important; transition: all 0.16s ease !important;
+}
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+  transform: translateY(-2px) !important; color: #ffffff !important;
+  box-shadow: 0 10px 24px rgba(168, 85, 247, 0.42) !important;
+}
+.stButton > button p,
+.stDownloadButton > button p,
+.stButton > button span,
+.stDownloadButton > button span {
+  color: #ffffff !important; font-weight: 700 !important;
+}
+
+/* ── KPI GRID & VIBRANT CARDS ───────────────────────────────────────────── */
+.kpi-grid {
+  display: grid; gap: 0.85rem; margin-bottom: 1.1rem;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+@media (max-width: 900px) {
+  .kpi-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+}
+.kpi {
+  border-radius: 18px !important; padding: 1.05rem 1.15rem !important; color: #ffffff !important;
+  position: relative !important; overflow: hidden !important;
+  box-shadow: 0 8px 22px rgba(90, 25, 120, 0.20) !important;
+  transition: transform 0.18s ease !important; min-width: 0 !important;
+}
+.kpi:hover { transform: translateY(-3px) !important; }
+.kpi:after {
+  content: ""; position: absolute; right: -30px; top: -30px; width: 88px;
+  height: 88px; border-radius: 50%; background: rgba(255, 255, 255, 0.15);
+}
+.kpi, .kpi * {
+  color: #ffffff !important;
+}
+.kpi .lbl {
+  font-size: 0.66rem !important; text-transform: uppercase !important; letter-spacing: 0.06em !important;
+  font-weight: 700 !important; opacity: 0.92 !important;
+  white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
+}
+.kpi .val {
+  font-size: clamp(1.25rem, 2.1vw, 1.8rem) !important; font-weight: 800 !important;
+  letter-spacing: -0.03em !important; line-height: 1.2 !important; margin-top: 0.3rem !important;
+  white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;
+}
+.kpi .fin {
+  font-size: 0.68rem !important; opacity: 0.88 !important; margin-top: 0.2rem !important;
+  font-weight: 500 !important; white-space: nowrap !important;
+}
+
+.g1 { background: linear-gradient(135deg, #f43f5e, #ec4899 55%, #d946ef) !important; }
+.g2 { background: linear-gradient(135deg, #8b5cf6, #6366f1 60%, #4f46e5) !important; }
+.g3 { background: linear-gradient(135deg, #06b6d4, #0ea5e9 60%, #3b82f6) !important; }
+.g4 { background: linear-gradient(135deg, #f59e0b, #f97316 60%, #ef4444) !important; }
+.g5 { background: linear-gradient(135deg, #10b981, #059669 60%, #047857) !important; }
+.gneg { background: linear-gradient(135deg, #475569, #64748b) !important; }
+.gmute { background: linear-gradient(135deg, #e6e0ee, #efeaf6) !important; box-shadow: none !important; border: 1px dashed #ddd2ea !important; }
+.gmute, .gmute * { color: #7c6f8c !important; }
+.gmute .val { color: #a99bbd !important; }
+
+/* ── STAT TILES ─────────────────────────────────────────────────────────── */
+.stat {
+  background: #ffffff !important; border-radius: 16px !important; padding: 0.95rem 1.1rem !important;
+  border: 1px solid #f0e9f7 !important; box-shadow: 0 2px 10px rgba(80, 20, 120, 0.045) !important;
+  margin-bottom: 0.8rem !important;
+}
+.stat .lbl {
+  font-size: 0.68rem !important; color: #8b7d9c !important; text-transform: uppercase !important;
+  letter-spacing: 0.08em !important; font-weight: 700 !important;
+}
+.stat .val {
+  font-size: 1.32rem !important; font-weight: 800 !important; color: #1e1035 !important;
+  letter-spacing: -0.02em !important; margin-top: 0.15rem !important;
+}
+
+/* ── CATALYST CARDS ─────────────────────────────────────────────────────── */
+.cat-high {
+  background: linear-gradient(135deg, #fff1f2, #ffe4e6) !important;
+  border-left: 4px solid #f43f5e !important; padding: 12px !important;
+  border-radius: 12px !important; margin-bottom: 8px !important;
+}
+.cat-high, .cat-high * { color: #9f1239 !important; }
+.cat-med {
+  background: linear-gradient(135deg, #fffbeb, #fef3c7) !important;
+  border-left: 4px solid #f59e0b !important; padding: 12px !important;
+  border-radius: 12px !important; margin-bottom: 8px !important;
+}
+.cat-med, .cat-med * { color: #92400e !important; }
+.cat-low {
+  background: linear-gradient(135deg, #f0fdf4, #dcfce7) !important;
+  border-left: 4px solid #10b981 !important; padding: 12px !important;
+  border-radius: 12px !important; margin-bottom: 8px !important;
+}
+.cat-low, .cat-low * { color: #166534 !important; }
+.cat-earn {
+  background: linear-gradient(135deg, #f5f3ff, #ede9fe) !important;
+  border-left: 4px solid #8b5cf6 !important; padding: 12px !important;
+  border-radius: 12px !important; margin-bottom: 8px !important;
+}
+.cat-earn, .cat-earn * { color: #5b21b6 !important; }
+
+/* ── EMPTY STATE ────────────────────────────────────────────────────────── */
+.empty { text-align: center; padding: 2.6rem 1rem; color: #9b8aa6; }
+.empty .ico { font-size: 2rem; opacity: 0.5; color: #a855f7 !important; }
+.empty .t { font-weight: 700; color: #5c4d70 !important; margin-top: 0.5rem; font-size: 0.98rem; }
+.empty .s { font-size: 0.82rem; margin-top: 0.25rem; color: #8b7d9c !important; }
+
+/* ── BANNER GUARDS & DATA TABLE ─────────────────────────────────────────── */
+.banner-danger {
+  background: #fff1f2 !important; border: 1px solid #fecdd3 !important;
+  border-radius: 14px !important; padding: 1rem !important; margin-bottom: 1rem !important;
+}
+.banner-danger, .banner-danger * { color: #9f1239 !important; }
+.banner-danger h4 { margin: 0 0 0.25rem 0 !important; font-weight: 800 !important; }
+
+.banner-success {
+  background: #f0fdf4 !important; border: 1px solid #bbf7d0 !important;
+  border-radius: 14px !important; padding: 1rem !important; margin-bottom: 1rem !important;
+  font-weight: 700 !important;
+}
+.banner-success, .banner-success * { color: #166534 !important; }
+
+.data-table-custom {
+  width: 100%; border-collapse: collapse; margin-top: 0.8rem; font-size: 0.88rem;
+}
+.data-table-custom th {
+  background: #f3edf9 !important; color: #3f2c56 !important; font-weight: 700 !important;
+  padding: 0.65rem 0.85rem !important; text-align: left !important; border-bottom: 1px solid #e2d2f0 !important;
+}
+.data-table-custom td {
+  padding: 0.55rem 0.85rem !important; border-bottom: 1px solid #f2ecf8 !important; color: #2d1b42 !important;
+}
+.td-highlight { font-weight: 700 !important; color: #7c3aed !important; }
+.td-success { font-weight: 700 !important; color: #059669 !important; }
+
+div[data-testid="stDataFrame"] {
+  border-radius: 14px !important; overflow: hidden !important;
+  background: #ffffff !important; border: 1px solid #efe6f6 !important;
+  box-shadow: 0 3px 14px rgba(80, 20, 120, 0.05) !important;
+}
+
+.quote-item {
+  display: flex; align-items: flex-start; gap: 0.6rem; padding: 0.55rem 0;
+  border-bottom: 1px solid #f2ecf8; font-size: 0.88rem; color: #3f2c56 !important;
+}
+.quote-item * { color: #3f2c56 !important; }
+.quote-bullet {
+  width: 6px; height: 6px; border-radius: 50%; background: #a855f7 !important;
+  margin-top: 0.45rem; flex-shrink: 0;
+}
 </style>
-"""
+""", unsafe_allow_html=True)
 
-GRADS = {"B13_NAKED13": "g1", "B13_NAKED125": "g1", "B125_NAKED125": "g5",
-         "B125_NAKED13": "g5", "B13_EMA21": "g2", "B125_EMA21": "g2",
-         "B13_SUPERTREND": "g3", "B125_SUPERTREND": "g3"}
-
-
-def kpi(label, value, footnote="", grad="g1"):
-    return (f'<div class="kpi {grad}"><div class="lbl">{label}</div>'
-            f'<div class="val">{value}</div><div class="fin">{footnote}</div></div>')
-
-
-def stat(label, value):
-    return f'<div class="stat"><div class="lbl">{label}</div><div class="val">{value}</div></div>'
-
-
-def panel(title, sub=""):
-    return f'<div class="panel"><h4>{title}</h4><div class="sub">{sub}</div></div>' 
-
-
-def empty_state(title, sub, ico="◇"):
-    return (f'<div class="panel"><div class="empty"><div class="ico">{ico}</div>'
-            f'<div class="t">{title}</div><div class="s">{sub}</div></div></div>')
-
-
-def header(title, tag="", live=False):
-    """tag is accepted and ignored — the header subtitle was removed on
-    request. Kept in the signature so existing call sites still work."""
-    dot = "dot-live" if live else "dot-off"
-    when = f"{now_ist():%H:%M}"
-    txt = f"Session open · {when}" if live else f"Session closed · {when}"
-    return (f'<div class="hdr"><div><h1>{title}</h1></div>'
-            f'<div class="chip"><span class="dot {dot}"></span>{txt}</div></div>')
-
-
-def money(x):
+# ── Data Storage Layer (Google Sheets Two-Way Sync) ─────────────────────────
+def init_gspread():
+    if not HAS_GSPREAD:
+        return None
     try:
-        return f"{float(x):+,.0f}"
+        if "gcp_service_account" in st.secrets:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+            return gspread.authorize(creds)
     except Exception:
-        return "--"
+        pass
+    return None
 
+def _ensure_local():
+    if "db" not in st.session_state:
+        st.session_state.db = {
+            "Buy_Log": pd.DataFrame(columns=[
+                "Date", "Trade_ID", "Instrument", "Entry_Time", "Exit_Time",
+                "Entry_Price", "Exit_Price", "Points_SL", "Points_Gained", "Lots", "PnL", "Result", "Notes"
+            ]),
+            "Sell_Log": pd.DataFrame(columns=[
+                "Date", "Trade_ID", "Strategy", "CE_Entry", "CE_Exit", "PE_Entry", "PE_Exit",
+                "SL_Percentage", "Lots", "Total_PnL", "Status", "Notes"
+            ]),
+            "Events": pd.DataFrame(columns=["Date", "Time", "Country", "Event_Name", "Impact_Level"]),
+            "Results": pd.DataFrame(columns=["Date", "Time", "Company_Symbol", "Market_Expectation"])
+        }
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def expiries_for(day):
-    _, exp = option_universe()
-    return expiry_choices(exp, day)
+def get_data(tab):
+    _ensure_local()
+    client = init_gspread()
+    sheet_id = st.secrets.get("sheet_id", "") if "sheet_id" in st.secrets else ""
+    if client and sheet_id:
+        try:
+            ws = client.open_by_key(sheet_id).worksheet(tab)
+            rec = ws.get_all_records()
+            if rec:
+                df_remote = pd.DataFrame(rec)
+                st.session_state.db[tab] = df_remote
+                return df_remote
+        except Exception:
+            pass
+    return st.session_state.db.get(tab, pd.DataFrame())
 
+def append_row(tab, row):
+    _ensure_local()
+    client = init_gspread()
+    sheet_id = st.secrets.get("sheet_id", "") if "sheet_id" in st.secrets else ""
+    if client and sheet_id:
+        try:
+            ws = client.open_by_key(sheet_id).worksheet(tab)
+            ws.append_row(list(row.values()))
+        except Exception as e:
+            st.toast(f"Sheets sync warning: {e}")
+    # Local update
+    df = st.session_state.db[tab]
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    st.session_state.db[tab] = df
+    get_data(tab)
 
-def equity_chart(S):
-    """Cumulative P&L per variant."""
-    if S.empty:
-        return None
-    d = S.copy()
-    d["total_pnl"] = pd.to_numeric(d.total_pnl, errors="coerce").fillna(0)
-    d["trading_date"] = pd.to_datetime(d.trading_date)
-    d = d.sort_values("trading_date")
-    d["cum"] = d.groupby("strategy").total_pnl.cumsum()
-    return (alt.Chart(d).mark_line(strokeWidth=2.5, point=alt.OverlayMarkDef(size=35))
-            .encode(x=alt.X("trading_date:T", title=None,
-                            axis=alt.Axis(grid=False, labelColor="#9b8aa6")),
-                    y=alt.Y("cum:Q", title="cumulative P&L",
-                            axis=alt.Axis(gridColor="#f4e9f0", labelColor="#9b8aa6")),
-                    color=alt.Color("strategy:N", title=None,
-                                    scale=alt.Scale(domain=list(GRADS),
-                                                    range=["#ec4899", "#f43f5e", "#10b981", "#059669",
-                                           "#8b5cf6", "#6366f1", "#0ea5e9",
-                                           "#06b6d4"]),
-                                    legend=alt.Legend(orient="top")),
-                    tooltip=["trading_date:T", "strategy:N", "cum:Q", "total_pnl:Q"])
-            .properties(height=260).configure_view(strokeWidth=0))
+def clear_tab(tab):
+    _ensure_local()
+    client = init_gspread()
+    sheet_id = st.secrets.get("sheet_id", "") if "sheet_id" in st.secrets else ""
+    if client and sheet_id:
+        try:
+            ws = client.open_by_key(sheet_id).worksheet(tab)
+            ws.clear()
+            hdr = list(st.session_state.db[tab].columns)
+            if hdr:
+                ws.append_row(hdr)
+        except Exception:
+            pass
+    st.session_state.db[tab] = st.session_state.db[tab].iloc[0:0]
 
-
-def reason_chart(T):
-    """Exit reasons by count."""
-    if T.empty or "exit_reason" not in T.columns:
-        return None
-    g = T.groupby("exit_reason").size().reset_index(name="n")
-    return (alt.Chart(g).mark_arc(innerRadius=52, stroke="#fff", strokeWidth=2)
-            .encode(theta="n:Q",
-                    color=alt.Color("exit_reason:N", title=None,
-                                    scale=alt.Scale(scheme="purpleorange"),
-                                    legend=alt.Legend(orient="right")),
-                    tooltip=["exit_reason:N", "n:Q"])
-            .properties(height=240).configure_view(strokeWidth=0))
-
-
-st.markdown(CSS, unsafe_allow_html=True)
-
-missing = [k for k in ("angel", "sheets", "gcp_service_account") if k not in st.secrets]
-if missing:
-    st.error(f"Missing secrets: {', '.join(missing)}. Add them in Settings → Secrets.")
-    st.stop()
-for _k, _v in SHEET_KEYS.items():
-    if _v not in st.secrets["sheets"]:
-        st.error(f"Missing [sheets] {_v} in secrets (needed for {_k}).")
-        st.stop()
-
-TODAY = today_ist()
-NOW = now_ist()
-SESSION_LIVE = (TODAY.weekday() < 5 and dt.time(9, 15) <= NOW.time() < dt.time(15, 30))
-SESSION_OVER = NOW.time() >= dt.time(15, 30)
-
-# ---------------- sidebar ----------------
+# ── Sidebar Navigation ─────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown('<div class="brand"><span class="brand-dot"></span>Straddle Desk</div>'
-                '<div class="brand-sub">NIFTY · short premium</div>',
-                unsafe_allow_html=True)
-    page = st.radio("nav", ["Live run", "Backtest", "History"],
-                    label_visibility="collapsed")
-    st.markdown('<div class="side-sep"></div><div class="side-lbl">Configuration</div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="brand"><span class="brand-dot"></span>Super App Nifty</div>'
+                '<div class="brand-sub">Matrix Trading Terminal</div>', unsafe_allow_html=True)
+
+    page = st.radio("Navigation", [
+        "Home & Rules",
+        "Option Buying",
+        "Option Selling",
+        "Events & Earnings",
+        "Dashboard",
+    ], label_visibility="collapsed")
+
+    st.markdown('<div class="side-sep"></div><div class="side-lbl">System Specs</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="side-kv"><span>Front-month</span><b>{NIFTY_FUT_TOKEN}</b></div>'
-        f'<div class="side-kv"><span>Lot size</span><b>{LOT_SIZE}</b></div>'
-        f'<div class="side-kv"><span>Base SL</span><b>{SL_MULTIPLIER}x</b></div>'
-        f'<div class="side-kv"><span>Tight SL</span><b>{TIGHT_SL_MULTIPLIER}x</b></div>'
-        f'<div class="side-kv"><span>Tighten</span><b>{TIGHTEN_MODE.split("_")[0].title()}</b></div>'
-        f'<div class="side-kv"><span>Max/day</span><b>{MAX_STRADDLES_PER_DAY}</b></div>'
-        f'<div class="side-kv"><span>Entry window</span>'
-        f'<b>{ENTRY_START:%H:%M}-{ENTRY_END:%H:%M}</b></div>'
-        f'<div class="side-kv"><span>Hard exit</span><b>{HARD_EXIT:%H:%M}</b></div>',
-        unsafe_allow_html=True)
-    st.markdown('<div class="side-sep"></div><div class="side-lbl">Stop-loss rules</div>',
-                unsafe_allow_html=True)
-
-    _engine_live = live_engine_thread() is not None
-    if _engine_live:
-        st.caption("Locked while the engine is running — stop it to change these.")
-
-    with st.expander("Adjust", expanded=False):
-        _slm = st.slider("Default base SL (x premium)", 1.10, 1.60,
-                         SL_MULTIPLIER, 0.05, disabled=_engine_live,
-                         help="Each variant carries its own base and naked SL. "
-                              "This is only the fallback for an engine without "
-                              "one of its own.")
-        _tsm = st.slider("Tightened SL (x premium)", 1.05, 1.50,
-                         TIGHT_SL_MULTIPLIER, 0.05, disabled=_engine_live,
-                         help="Applied to the hurt leg when DYNAMIC_SL confirms a trend.")
-        _fas = st.checkbox("Fill at the stop level", SL_FILL_AT_STOP,
-                           disabled=_engine_live,
-                           help="Off = fill at the candle close when the bar closed "
-                                "beyond the stop. On 11 Sep the two differed by 4,415.")
-        _slip = st.number_input("Slippage on an SL fill (points)", 0.0, 20.0,
-                                SL_SLIPPAGE_PTS, 0.5, disabled=_engine_live)
-
-        st.markdown("**Naked leg**")
-        st.caption("Each variant runs its own rule — these apply to the trailing "
-                   "variants only.")
-        _nt = st.selectbox(
-            "Trail trigger", ["HIGH", "CLOSE"],
-            index=["HIGH", "CLOSE"].index(NAKED_TRAIL_TRIGGER),
-            disabled=_engine_live,
-            help="HIGH fires on any wick — 2.3x as often as a close on real "
-                 "3-min data (~20 vs ~9 per session).")
-        _nb = st.slider("Trail buffer above the line (%)", 0.0, 20.0,
-                        NAKED_TRAIL_BUFFER_PCT, 1.0, disabled=_engine_live)
-        _lock = st.checkbox("Stepped profit lock", NAKED_STEP_ENABLED,
-                            disabled=_engine_live,
-                            help="Every N% of decay, cut the stop by N%. "
-                                 "Applies to every variant, trail or not.")
-        _lstep = st.slider("Decay per step (%)", 10.0, 50.0, NAKED_STEP_PCT, 5.0,
-                           disabled=_engine_live or not _lock)
-        _lcut = st.slider("Stop cut per step (%)", 10.0, 50.0, NAKED_STEP_SL_PCT, 5.0,
-                          disabled=_engine_live or not _lock)
-        _stp = st.slider("Supertrend period", 5, 20, ST_PERIOD, 1,
-                         disabled=_engine_live)
-        _stm = st.slider("Supertrend multiplier", 1.0, 4.0, ST_MULT, 0.5,
-                         disabled=_engine_live)
-        _nm = NAKED_MODE
-        _nr = st.checkbox("Re-base stop to LTP x base SL when the partner stops out",
-                          NAKED_REBASE_ON_PARTNER_SL, disabled=_engine_live)
-
-    if not _engine_live:
-        globals().update(SL_MULTIPLIER=_slm, TIGHT_SL_MULTIPLIER=_tsm,
-                         SL_FILL_AT_STOP=_fas, SL_SLIPPAGE_PTS=_slip,
-                         NAKED_TRAIL_TRIGGER=_nt, NAKED_TRAIL_BUFFER_PCT=_nb,
-                         NAKED_REBASE_ON_PARTNER_SL=_nr,
-                         ST_PERIOD=int(_stp), ST_MULT=float(_stm),
-                         NAKED_STEP_ENABLED=_lock, NAKED_STEP_PCT=float(_lstep),
-                         NAKED_STEP_SL_PCT=float(_lcut))
-
-    st.markdown(
-        f'<div class="side-kv"><span>Naked</span><b>{NAKED_MODE.replace("_"," ").title()}'
-        f'</b></div>'
-        f'<div class="side-kv"><span>Trigger</span><b>{NAKED_TRAIL_TRIGGER}</b></div>'
-        f'<div class="side-kv"><span>SL fill</span>'
-        f'<b>{"at stop" if SL_FILL_AT_STOP else "at close"}'
-        f'{f" +{SL_SLIPPAGE_PTS:g}" if SL_FILL_AT_STOP and SL_SLIPPAGE_PTS else ""}</b></div>',
+        '<div class="side-kv"><span>Lot Size</span><b>65 Qty</b></div>'
+        '<div class="side-kv"><span>Max Risk (Buy)</span><b>18 Points</b></div>'
+        '<div class="side-kv"><span>SL Rule (Sell)</span><b>30 %</b></div>'
+        '<div class="side-kv"><span>Time Window</span><b>09:30 - 14:45</b></div>'
+        '<div class="side-kv"><span>Breakeven At</span><b>1:2 RR</b></div>',
         unsafe_allow_html=True)
 
-    st.markdown('<div class="side-sep"></div><div class="side-lbl">Alerts</div>',
-                unsafe_allow_html=True)
-    _hook = discord_url()
-    if _hook:
-        notify_on = st.checkbox("Discord notifications", value=True,
-                                help="Entry, exit, SL tightened, leg naked, "
-                                     "plus engine start and session summary.")
-        if st.button("Send test"):
-            ok = discord(f"Test from Straddle Desk · {now_ist():%d %b %H:%M} IST",
-                         tag="🔔")
-            # A bare conditional expression here would be picked up by
-            # Streamlit's magic display, which parses the source line to name
-            # the value and fails on the continuation. Plain if/else instead.
-            if ok:
-                st.success("Sent — check the channel.")
-            else:
-                st.error("Failed. Check the webhook URL in secrets.")
-    else:
-        notify_on = False
-        st.caption("No webhook configured. Add `[discord] webhook = \"...\"` "
-                   "to secrets.")
     st.markdown('<div class="side-sep"></div>', unsafe_allow_html=True)
-    st.caption("Paper only. No orders are ever placed.")
+    today_date = datetime.date.today()
+    now_formatted = datetime.datetime.now().strftime("%H:%M")
+    st.markdown(
+        f'<div class="side-kv"><span>Date</span><b>{today_date.strftime("%d %b %Y")}</b></div>'
+        f'<div class="side-kv"><span>Time</span><b>{now_formatted} IST</b></div>',
+        unsafe_allow_html=True)
 
+# ── Main Header ────────────────────────────────────────────────────────────
+PAGE_TITLES = {
+    "Home & Rules":     ("Home / Matrix Terminal", "Execution parameters and market rules"),
+    "Option Buying":    ("Option Buying Module", "18-Point Risk Guardrail and Target Engine"),
+    "Option Selling":   ("Option Selling Module", "30% SL Rule and Multi-Leg Strategy Journal"),
+    "Events & Earnings":("Events & Earnings Tracker", "Scheduled market catalysts"),
+    "Dashboard":        ("Performance Dashboard", "Trade metrics and ledger management"),
+}
+title_text, subtitle_text = PAGE_TITLES[page]
+today_iso = today_date.isoformat()
 
-def render_kpis(S, variants, note=""):
-    """One CSS grid rather than st.columns — five fixed columns on a tablet
-    squeezed the figures; a grid wraps to a second row instead."""
-    cards = []
-    for v in variants:
-        g = S[S.strategy == v[0]] if not S.empty else S
-        has = not g.empty
-        pnl = pd.to_numeric(g.total_pnl, errors="coerce").sum() if has else 0
-        legs = int(pd.to_numeric(g.num_legs, errors="coerce").sum()) if has else 0
-        grad = ("gmute" if not has else
-                (GRADS.get(v[0], "g1") if pnl >= 0 else "gneg"))
-        label = v[0].replace("SL_", "").replace("_", " ")
-        cards.append(kpi(label, money(pnl) if has else "--",
-                         f"{legs} legs" if has else "no data", grad))
-    n = S.trading_date.nunique() if not S.empty else 0
-    cards.append(kpi("Sessions", str(n), note or "recorded",
-                     "g4" if n else "gmute"))
-    st.markdown('<div class="kpi-grid">' + "".join(cards) + "</div>",
-                unsafe_allow_html=True)
+st.markdown(f"""
+<div class="hdr">
+  <div>
+    <h1>{title_text}</h1>
+    <div class="tag">{subtitle_text}</div>
+  </div>
+  <div>
+    <span class="chip">
+      <span class="dot"></span>
+      {now_formatted} IST &nbsp;·&nbsp; {today_date.strftime("%d %b %Y")}
+    </span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 1: HOME & RULES
+# ═══════════════════════════════════════════════════════════════════════════
+if page == "Home & Rules":
 
-# ================================ LIVE ======================================
-if page == "Live run":
-    st.markdown(header("Live run", "FIXED_1_3X · DYNAMIC_SL — paper, no orders placed",
-                       SESSION_LIVE), unsafe_allow_html=True)
+    df_ev = get_data("Events")
+    df_re = get_data("Results")
 
-    reg = engine_registry()
-    orphan = live_engine_thread()
-    if reg["thread"] is None and orphan is not None:
-        # A thread survived without a registry entry — possible if the cache
-        # was cleared while the daemon kept running. Adopt it rather than
-        # letting the UI offer to start a second one.
-        reg["thread"] = orphan
+    col_l, col_r = st.columns([1.2, 1], gap="large")
 
-    running = reg["thread"] is not None and reg["thread"].is_alive()
-    if reg["thread"] is not None and not reg["thread"].is_alive():
-        reg["thread"] = None
-    status = reg["status"]
+    with col_l:
+        with st.container(border=True):
+            st.markdown('<h4>Market Catalysts Today</h4><div class="sub" style="margin-bottom:0.9rem;">High-impact economic events and corporate earnings</div>', unsafe_allow_html=True)
 
-    try:
-        exps = expiries_for(TODAY)
-    except Exception as e:
-        st.error(f"Could not load expiries: {e}"); st.stop()
+            if not df_ev.empty or not df_re.empty:
+                if not df_ev.empty:
+                    st.markdown("**Economic Events:**")
+                    for _, row in df_ev.iterrows():
+                        imp = str(row.get("Impact_Level", "MEDIUM")).upper()
+                        cls = "cat-high" if imp == "HIGH" else ("cat-med" if imp == "MEDIUM" else "cat-low")
+                        st.markdown(f"""
+                        <div class="{cls}">
+                          <b>{row.get('Event_Name','')}</b> ({row.get('Country','')})<br>
+                          <span style="font-size:0.78rem; opacity:0.85;">Date: {row.get('Date','')} · Time: {row.get('Time','')} · Impact: {imp}</span>
+                        </div>""", unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.1, 1])
-    with c1:
-        st.markdown(stat("Trading day", TODAY.strftime("%d %b %Y")), unsafe_allow_html=True)
-    with c2:
-        st.markdown(stat("Last bar", status.get("last_bar", "--")), unsafe_allow_html=True)
-    with c3:
-        exp_live = st.selectbox("Expiry", exps,
-                                format_func=lambda d: f"{d:%d %b} · {(d-TODAY).days}d",
-                                key="exp_live", label_visibility="collapsed",
-                                disabled=running)
-        st.caption("Expiry")
-    with c4:
-        st.write("")
-        if not running:
-            if st.button("Start engine", type="primary"):
-                age = sheet_heartbeat_age_min()
-                if age is not None and age < STALE_HEARTBEAT_MIN:
-                    st.error(
-                        f"Live_Status was written {age:.1f} min ago — an engine "
-                        "appears to be running elsewhere (another container, tab "
-                        "or device). Two engines would both trade and both write "
-                        f"to these sheets. Wait {STALE_HEARTBEAT_MIN} min after "
-                        "the last write, or stop the other one first.")
+                if not df_re.empty:
+                    st.markdown("**Corporate Results:**")
+                    for _, row in df_re.iterrows():
+                        st.markdown(f"""
+                        <div class="cat-earn">
+                          <b>{row.get('Company_Symbol','')} Results</b><br>
+                          <span style="font-size:0.78rem; opacity:0.85;">Date: {row.get('Date','')} · Timing: {row.get('Time','')} · Expectation: {row.get('Market_Expectation','')}</span>
+                        </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="empty">
+                  <div class="ico">◇</div>
+                  <div class="t">No Catalysts Logged for Today</div>
+                  <div class="s">Add upcoming economic events or earnings in the Events & Earnings tab.</div>
+                </div>""", unsafe_allow_html=True)
+
+        with st.container(border=True):
+            st.markdown('<h4>Matrix System Core Rules</h4><div class="sub" style="margin-bottom:0.9rem;">Mandatory risk guardrails for professional trading discipline</div>', unsafe_allow_html=True)
+            rules = [
+                ("18-Point Option Buying Risk Guardrail", "Maximum allowed risk per trade is strictly capped at 18 points. Any trade setup exceeding 18 points is automatically blocked."),
+                ("30% Option Selling Stop Loss Rule", "For option writing, stop loss is pinned at exactly 30% above entry premium. Breaches trigger immediate exit."),
+                ("Mandatory Post-Mortem Loss Notes", "If any trade closes in a negative PnL, detailed notes explaining what went wrong are strictly mandatory before submission."),
+                ("Target & Trailing SL Ladder", "1:1 to 1:6 target progression with breakeven trail on T1 achievement to protect accumulated capital.")
+            ]
+            for title, desc in rules:
+                st.markdown(f"""
+                <div class="stat">
+                  <div class="lbl">{title}</div>
+                  <div style="font-size:0.88rem; color:#3f2c56; margin-top:0.3rem; font-weight:500;">{desc}</div>
+                </div>""", unsafe_allow_html=True)
+
+    with col_r:
+        with st.container(border=True):
+            st.markdown('<h4>Terminal Performance Metrics</h4><div class="sub" style="margin-bottom:0.9rem;">Real-time ledger overview</div>', unsafe_allow_html=True)
+
+            df_buy_m = get_data("Buy_Log")
+            df_sell_m = get_data("Sell_Log")
+            pnl_b = pd.to_numeric(df_buy_m["PnL"], errors="coerce").sum() if not df_buy_m.empty and "PnL" in df_buy_m.columns else 0.0
+            pnl_s = pd.to_numeric(df_sell_m["Total_PnL"], errors="coerce").sum() if not df_sell_m.empty and "Total_PnL" in df_sell_m.columns else 0.0
+            total_pnl_m = pnl_b + pnl_s
+
+            st.markdown(f"""
+            <div class="kpi-grid">
+              <div class="kpi {'g1' if total_pnl_m < 0 else 'g5'}">
+                <div class="lbl">Combined Net PnL</div>
+                <div class="val">INR {total_pnl_m:+,.2f}</div>
+                <div class="fin">Live session aggregate</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div class="stat">
+              <div class="lbl">Total Trades Logged</div>
+              <div class="val">{len(df_buy_m) + len(df_sell_m)} Executions</div>
+            </div>
+            <div class="stat">
+              <div class="lbl">Google Sheets Status</div>
+              <div class="val" style="color: #059669; font-size:1.1rem; font-weight:700;">{"Connected & Synchronized" if HAS_GSPREAD and st.secrets.get("sheet_id") else "Local Memory Active"}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with st.container(border=True):
+            st.markdown('<h4>Trading Mindset</h4><div class="sub" style="margin-bottom:0.9rem;">Discipline framework</div>', unsafe_allow_html=True)
+            quotes = [
+                "A missed trade is better than a forced trade.",
+                "Don't let fear of missing out drive your decisions.",
+                "Control your emotions, not the market.",
+                "Plan the trade and trade the plan. Never let emotions write your execution log.",
+                "Cut your losses short and let your winners run — respect the 18pt guardrail."
+            ]
+            for q in quotes:
+                st.markdown(f'<div class="quote-item"><div class="quote-bullet"></div><div class="quote-txt">{q}</div></div>', unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 2: OPTION BUYING
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "Option Buying":
+
+    col_l, col_r = st.columns([1.1, 1], gap="large")
+
+    with col_l:
+        with st.container(border=True):
+            st.markdown('<h4>Risk & Target Calculator</h4><div class="sub" style="margin-bottom:1rem;">Enforces 18-point maximum risk rule</div>', unsafe_allow_html=True)
+
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                b_entry = st.number_input("Entry Price (INR)", min_value=0.0, value=0.0, step=0.5, key="b_entry")
+                b_dir   = st.selectbox("Direction", ["BUY CE (Long)", "BUY PE (Short)"], key="b_dir")
+            with bc2:
+                b_sl    = st.number_input("Stop Loss (INR)", min_value=0.0, value=0.0, step=0.5, key="b_sl")
+            with bc3:
+                b_lots  = st.number_input("Lots (65 Qty)", min_value=1, value=1, key="b_lots")
+
+            risk = round(b_entry - b_sl, 2)
+            qty  = b_lots * 65
+
+            if b_entry == 0.0 or b_sl == 0.0:
+                st.info("Enter Entry Price and Stop Loss above to calculate target grid and risk parameters.")
+            elif risk <= 0:
+                st.warning("Stop loss must be lower than entry price.")
+            elif risk > 18.0:
+                st.markdown(f"""
+                <div class="banner-danger">
+                  <h4>GUARDRAIL VIOLATED — {risk} POINTS RISK</h4>
+                  <p>Maximum allowed risk is 18.0 points. Position rejected by system.</p>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="banner-success">Risk Approved: {risk} Points &nbsp;·&nbsp; Total Risk: INR {risk*qty:,.2f}</div>', unsafe_allow_html=True)
+                prev = b_entry
+                rows_h = ""
+                for i in range(1, 7):
+                    tgt  = round(b_entry + risk * i, 2)
+                    trail = "Entry (Breakeven)" if i == 1 else f"T{i-1} ({prev:.2f})"
+                    prof  = round(risk * i * qty, 2)
+                    prev  = tgt
+                    rows_h += f'<tr><td class="td-highlight">1:{i}</td><td class="td-success">{tgt:.2f}</td><td>{trail}</td><td class="td-success">INR {prof:,.2f}</td></tr>'
+
+                st.markdown(f"""
+                <table class="data-table-custom">
+                  <thead><tr><th>Risk:Reward</th><th>Target Price</th><th>Trail SL To</th><th>Profit Projection</th></tr></thead>
+                  <tbody>{rows_h}</tbody>
+                </table>
+                """, unsafe_allow_html=True)
+
+    with col_r:
+        with st.form("buy_form", clear_on_submit=True):
+            st.markdown('<h4>Log Buying Trade</h4><div class="sub" style="margin-bottom:1rem;">Notes are mandatory for trades ending in loss</div>', unsafe_allow_html=True)
+
+            jc1, jc2 = st.columns(2)
+            with jc1:
+                j_date  = st.date_input("Date", today_date)
+                j_instr = st.text_input("Strike / Instrument", "NIFTY 24500 CE")
+                j_entry_t = st.time_input("Entry Time", datetime.time(9, 30))
+                j_exit_t  = st.time_input("Exit Time",  datetime.time(10, 0))
+            with jc2:
+                j_entry_p = st.number_input("Entry Price (INR)", min_value=0.1, value=150.0, step=0.5)
+                j_exit_p  = st.number_input("Exit Price (INR)",  min_value=0.1, value=165.0, step=0.5)
+                j_sl_pts  = st.number_input("SL Points Used", min_value=0.1, max_value=18.0, value=15.0)
+                j_lots    = st.number_input("Lots Executed",  min_value=1, value=1)
+
+            auto_pnl = round((j_exit_p - j_entry_p) * j_lots * 65, 2)
+            result_label = "Profit" if auto_pnl > 0 else ("Loss" if auto_pnl < 0 else "Breakeven")
+
+            note_label = "What went wrong? (MANDATORY for Loss)" if auto_pnl < 0 else "Execution Notes"
+            j_notes = st.text_area(note_label, placeholder="Describe setup, market context, or mistakes...", height=85)
+
+            if st.form_submit_button("Save Trade to Database", use_container_width=True):
+                if auto_pnl < 0 and not j_notes.strip():
+                    st.error("Submission blocked: Trade resulted in a loss. Detailed notes are mandatory.")
                 else:
-                    reg["stop"] = threading.Event()
-                    reg["status"] = {"state": "starting", "log": []}
-                    reg["started_at"] = now_ist()
-                    th = threading.Thread(target=live_engine_loop,
-                                          args=(reg["stop"], exp_live,
-                                                reg["status"], notify_on,
-                                                snapshot_tunables()),
-                                          daemon=True, name=ENGINE_THREAD_NAME)
-                    th.start()
-                    reg["thread"] = th
-                    time.sleep(1)
+                    tid = f"BUY-{random.randint(1000,9999)}"
+                    append_row("Buy_Log", {
+                        "Date": str(j_date), "Trade_ID": tid,
+                        "Instrument": j_instr,
+                        "Entry_Time": str(j_entry_t), "Exit_Time": str(j_exit_t),
+                        "Entry_Price": j_entry_p, "Exit_Price": j_exit_p,
+                        "Points_SL": j_sl_pts,
+                        "Points_Gained": round(j_exit_p - j_entry_p, 2),
+                        "Lots": j_lots, "PnL": auto_pnl,
+                        "Result": result_label, "Notes": j_notes,
+                    })
+                    st.success(f"Trade {tid} saved successfully. PnL: INR {auto_pnl:,.2f}")
                     st.rerun()
+
+    with st.container(border=True):
+        st.markdown('<h4>Buying Trade History</h4><div class="sub" style="margin-bottom:0.75rem;">Executed option buying ledger</div>', unsafe_allow_html=True)
+        df_buy = get_data("Buy_Log")
+        if not df_buy.empty:
+            st.dataframe(df_buy, use_container_width=True, hide_index=True)
         else:
-            if st.button("Stop engine"):
-                if reg["stop"] is not None:
-                    reg["stop"].set()
-                reg["thread"].join(timeout=8)
-                reg["thread"] = None
+            st.info("No buying trades recorded yet.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 3: OPTION SELLING
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "Option Selling":
+
+    col_l, col_r = st.columns([1.1, 1], gap="large")
+
+    with col_l:
+        with st.container(border=True):
+            st.markdown('<h4>Stop Loss Calculator (30% Rule)</h4><div class="sub" style="margin-bottom:1rem;">Calculates precise SL price for option writing</div>', unsafe_allow_html=True)
+
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                s_entry = st.number_input("Entry Premium (INR)", min_value=0.0, value=0.0, step=0.5, key="s_entry")
+            with sc2:
+                s_pct   = st.number_input("SL Percentage (%)", min_value=1.0, max_value=200.0, value=30.0, step=1.0)
+            with sc3:
+                s_lots  = st.number_input("Lots (65 Qty)", min_value=1, value=1, key="s_lots")
+
+            if s_entry == 0.0:
+                st.info("Enter Entry Premium above to calculate stop-loss trigger price and max risk.")
+            else:
+                sl_price  = round(s_entry * (1 + s_pct / 100), 2)
+                sl_pts    = round(sl_price - s_entry, 2)
+                max_loss  = round(sl_pts * s_lots * 65, 2)
+
+                st.markdown(f"""
+                <div class="kpi-grid" style="margin-top: 1rem;">
+                  <div class="kpi g1">
+                    <div class="lbl">SL Trigger Price</div>
+                    <div class="val">INR {sl_price}</div>
+                    <div class="fin">{s_pct}% above entry</div>
+                  </div>
+                  <div class="kpi g2">
+                    <div class="lbl">Risk in Points</div>
+                    <div class="val">+{sl_pts} pts</div>
+                    <div class="fin">per quantity</div>
+                  </div>
+                  <div class="kpi g3">
+                    <div class="lbl">Max Loss</div>
+                    <div class="val">INR {max_loss:,.2f}</div>
+                    <div class="fin">{s_lots} Lot ({s_lots*65} Qty)</div>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    with col_r:
+        with st.form("sell_form", clear_on_submit=True):
+            st.markdown('<h4>Log Selling Trade</h4><div class="sub" style="margin-bottom:1rem;">Supports Multi-Leg (CE + PE) execution</div>', unsafe_allow_html=True)
+
+            s_strategy = st.selectbox("Strategy Type", ["Short Straddle","Short Strangle","Naked CE Sell","Naked PE Sell"])
+            s_date = st.date_input("Date", today_date, key="s_date")
+            s_lots_j = st.number_input("Lots Executed", min_value=1, value=1, key="s_lots_j")
+
+            ce_c, pe_c = st.columns(2)
+            with ce_c:
+                st.markdown("**CE Leg**")
+                ce_entry = st.number_input("CE Entry (INR)", min_value=0.0, value=100.0, step=0.5)
+                ce_exit  = st.number_input("CE Exit (INR)",  min_value=0.0, value=70.0,  step=0.5)
+            with pe_c:
+                st.markdown("**PE Leg**")
+                pe_entry = st.number_input("PE Entry (INR)", min_value=0.0, value=100.0, step=0.5)
+                pe_exit  = st.number_input("PE Exit (INR)",  min_value=0.0, value=120.0, step=0.5)
+
+            s_status = st.selectbox("Exit Status", ["Target Achieved","SL Hit","Squared off at Close"])
+            sell_pnl = round(((ce_entry - ce_exit) + (pe_entry - pe_exit)) * s_lots_j * 65, 2)
+
+            s_note_lbl = "What went wrong? (MANDATORY for Loss)" if sell_pnl < 0 else "Trade Remarks"
+            s_notes = st.text_area(s_note_lbl, placeholder="Describe entry reasons, delta adjustments, or IV remarks...", height=80)
+
+            if st.form_submit_button("Save Selling Trade", use_container_width=True):
+                if sell_pnl < 0 and not s_notes.strip():
+                    st.error("Submission blocked: Notes are mandatory for losing trades.")
+                else:
+                    tid = f"SELL-{random.randint(1000,9999)}"
+                    append_row("Sell_Log", {
+                        "Date": str(s_date), "Trade_ID": tid,
+                        "Strategy": s_strategy,
+                        "CE_Entry": ce_entry, "CE_Exit": ce_exit,
+                        "PE_Entry": pe_entry, "PE_Exit": pe_exit,
+                        "SL_Percentage": s_pct if 's_pct' in locals() else 30.0,
+                        "Lots": s_lots_j, "Total_PnL": sell_pnl,
+                        "Status": s_status, "Notes": s_notes,
+                    })
+                    st.success(f"Selling trade {tid} saved. Total PnL: INR {sell_pnl:,.2f}")
+                    st.rerun()
+
+    with st.container(border=True):
+        st.markdown('<h4>Selling Trade History</h4><div class="sub" style="margin-bottom:0.75rem;">Executed option writing ledger</div>', unsafe_allow_html=True)
+        df_sell = get_data("Sell_Log")
+        if not df_sell.empty:
+            st.dataframe(df_sell, use_container_width=True, hide_index=True)
+        else:
+            st.info("No selling trades recorded yet.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 4: EVENTS & EARNINGS
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "Events & Earnings":
+
+    col_l, col_r = st.columns(2, gap="large")
+
+    with col_l:
+        with st.form("ev_form", clear_on_submit=True):
+            st.markdown('<h4>Add Economic Event</h4><div class="sub" style="margin-bottom:1rem;">Record macro catalysts and releases</div>', unsafe_allow_html=True)
+            e_date    = st.date_input("Date", today_date, key="e_d")
+            e_time    = st.time_input("Time", datetime.time(17, 30))
+            e_country = st.selectbox("Country", ["INDIA","US","EU","UK","CHINA","JAPAN"])
+            e_name    = st.text_input("Event Name", placeholder="RBI Rate Decision / US CPI Data")
+            e_impact  = st.selectbox("Impact Level", ["HIGH","MEDIUM","LOW"])
+            if st.form_submit_button("Add Event", use_container_width=True):
+                append_row("Events", {"Date": str(e_date), "Time": str(e_time),
+                                      "Country": e_country, "Event_Name": e_name,
+                                      "Impact_Level": e_impact})
+                st.success("Event added successfully.")
                 st.rerun()
 
-    if not running and SESSION_OVER and TODAY.weekday() < 5:
-        st.caption("Session has ended for today. Starting the engine now will "
-                   "replay the completed day and write its record.")
-
-    state = status.get("state", "idle")
-    if running:
-        st.success(f"Engine {state} · polls each 3-min bar close and writes to Sheets. "
-                   "It keeps running after you close this tab, until the market closes "
-                   "or the container is recycled.")
-    elif state in ("finished", "finished_with_errors"):
-        st.info(f"Engine {state.replace('_', ' ')}. Daily summary written.")
-    elif state == "failed":
-        st.error("Engine failed to start — see the log below.")
-
-    summ = status.get("summary")
-    if summ:
-        # .get with fallbacks: the summary dict gained realised/unrealised keys
-        # and a stale reader here crashed the page after the engine finished.
-        S_live = pd.DataFrame([{"strategy": k,
-                                "total_pnl": v.get("total", v.get("realised",
-                                                                  v.get("pnl", 0))),
-                                "num_legs": v.get("closed", 0),
-                                "trading_date": str(TODAY)}
-                               for k, v in summ.items()])
-        render_kpis(S_live, VARIANTS_LIVE, TODAY.strftime("%d %b"))
-        det = pd.DataFrame([{"strategy": k, **v} for k, v in summ.items()])
-        with st.expander(f"Current state · as of {status.get('last_bar','--')}",
-                         expanded=False):
-            st.dataframe(det, use_container_width=True, hide_index=True)
-    else:
-        try:
-            ST = read_tab("LIVE", TAB_STATUS)
-        except Exception:
-            ST = pd.DataFrame()
-        if ST.empty:
-            render_kpis(pd.DataFrame(columns=["strategy", "total_pnl", "num_legs",
-                                              "trading_date"]), VARIANTS_LIVE)
-            st.markdown(empty_state("Nothing recorded yet",
-                        "Start the engine — it writes the status sheet each bar.", "◇"),
-                        unsafe_allow_html=True)
-        else:
-            ST["leg_pnl"] = pd.to_numeric(ST.leg_pnl, errors="coerce").fillna(0)
-            agg = (ST.groupby("strategy")
-                     .agg(total_pnl=("leg_pnl", "sum"), num_legs=("leg_pnl", "size"))
-                     .reset_index())
-            agg["trading_date"] = ST.trading_date.iloc[0] if len(ST) else str(TODAY)
-            render_kpis(agg, VARIANTS_LIVE,
-                        f"{ST.trading_date.iloc[0]}" if len(ST) else "")
-            with st.expander(f"Leg ledger · updated {ST.updated_at.iloc[-1]}",
-                             expanded=False):
-                st.dataframe(ST, use_container_width=True, hide_index=True,
-                             height=320)
-
-    if running and status.get("cfg"):
-        c = status["cfg"]
-        fill = "at stop" if c["SL_FILL_AT_STOP"] else "at close"
-        if c["SL_FILL_AT_STOP"] and c["SL_SLIPPAGE_PTS"]:
-            fill += f" +{c['SL_SLIPPAGE_PTS']:g}"
-        lock = (f"{c['NAKED_STEP_PCT']:g}%/{c['NAKED_STEP_SL_PCT']:g}%"
-                if c["NAKED_STEP_ENABLED"] else "off")
-        st.caption(f"Settings frozen at start — base {c['SL_MULTIPLIER']:g}x · "
-                   f"SL fill {fill} · trigger {c['NAKED_TRAIL_TRIGGER']} · "
-                   f"profit lock {lock}")
-
-    if running and reg.get("started_at"):
-        st.caption(f"Engine started {reg['started_at']:%H:%M} IST · "
-                   f"thread `{ENGINE_THREAD_NAME}` · shared across all tabs "
-                   "and devices.")
-
-    lg = status.get("log")
-    if lg:
-        with st.expander(f"Engine log · {len(lg)} lines", expanded=False):
-            st.code("\n".join(lg[-40:]))
-    if running:
-        if st.button("Refresh view"):
-            st.rerun()
-        st.caption("The engine runs independently — refreshing only updates this page.")
-
-# ================================ BACKTEST =================================
-elif page == "Backtest":
-    st.markdown(header("Backtest", "", SESSION_LIVE), unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    mode = c1.radio("Range", ["Single day", "Date range"], key="bt_mode",
-                    horizontal=True)
-    if mode == "Single day":
-        bt_day = c2.date_input("Trading day", value=TODAY, key="bt_day")
-        days = [bt_day] if bt_day.weekday() < 5 else []
-        ref = bt_day
-    else:
-        d1 = c2.date_input("From", value=TODAY-dt.timedelta(days=7), key="bt_from")
-        d2 = c3.date_input("To", value=TODAY, key="bt_to")
-        days = [d for d in (d1+dt.timedelta(days=k) for k in range((d2-d1).days+1))
-                if d.weekday() < 5]
-        ref = d1
-    try:
-        bexps = expiries_for(ref)
-    except Exception as e:
-        st.error(f"Could not load expiries: {e}"); st.stop()
-
-    c4, c5, c6 = st.columns([1.3, 1.3, 1])
-    auto = c4.checkbox("Nearest expiry per day", value=True,
-                       help="Uncheck to force one expiry across the whole range.")
-    exp_bt = None if auto else c5.selectbox("Expiry", bexps,
-                                            format_func=lambda d: f"{d:%d %b %Y}",
-                                            key="exp_bt")
-    save = c6.checkbox("Save to sheet", value=False)
-    st.caption(f"{len(days)} weekday(s) selected · "
-               f"{len(VARIANTS_BACKTEST)} naked-leg rules · "
-               f"trigger **{NAKED_TRAIL_TRIGGER}** · SL fill "
-               f"**{'at stop' if SL_FILL_AT_STOP else 'at close'}"
-               f"{f' +{SL_SLIPPAGE_PTS:g}' if SL_FILL_AT_STOP else ''}** · "
-               f"base SL per variant — change the rest in the sidebar")
-
-    run_bt = st.button("Run backtest", type="primary")
-
-    if run_bt:
-        if not days:
-            st.warning("No weekdays selected.")
-        else:
-            p = st.progress(0.0, text="fetching candles")
-            try:
-                out, logs, notes, err = run_dates(days, "BACKTEST", VARIANTS_BACKTEST,
-                                                  expiry_override=exp_bt,
-                                                  finalize=True, progress=p)
-                p.empty()
-                if err:
-                    st.error(err)
-                else:
-                    T, S, H, O = out
-                    for n in notes:
-                        st.warning(n)
-                    if S.empty:
-                        st.markdown(empty_state("No trades",
-                                    "Entry conditions were not met in that range.", "○"),
-                                    unsafe_allow_html=True)
-                    else:
-                        render_kpis(S, VARIANTS_BACKTEST, f"{len(days)} weekdays")
-                        a, b = st.columns([1.9, 1])
-                        with a:
-                            ch = equity_chart(S)
-                            if ch is not None:
-                                st.markdown(panel("Cumulative P&L"), unsafe_allow_html=True)
-                                st.altair_chart(ch, use_container_width=True)
-                        with b:
-                            rc = reason_chart(T)
-                            if rc is not None:
-                                st.markdown(panel("Exit reasons"), unsafe_allow_html=True)
-                                st.altair_chart(rc, use_container_width=True)
-                        with st.expander(f"Per-session summary · {len(S)} rows",
-                                         expanded=False):
-                            st.dataframe(S.drop(columns=["run_type"], errors="ignore"),
-                                         use_container_width=True, hide_index=True)
-                        e1, e2 = st.columns(2)
-                        e1.download_button("Download trades", T.to_csv(index=False),
-                                           "straddle_trades.csv", "text/csv")
-                        if not H.empty:
-                            fired = (H.trend.astype(str) != "").sum()
-                            st.caption(f"Heartbeat: {len(H)} bars evaluated, "
-                                       f"trend fired on {fired}.")
-                            e2.download_button("Download heartbeat", H.to_csv(index=False),
-                                               "straddle_heartbeat.csv", "text/csv")
-                        if save:
-                            for _d, _g in T.groupby("trading_date"):
-                                append_rows("BACKTEST", tab_trades(_d), TRADE_HEADERS,
-                                            _g.values.tolist())
-                            append_rows("BACKTEST", "Backtest_Summary",
-                                        SUMMARY_HEADERS, S.values.tolist())
-                            if not H.empty:
-                                for _d, _g in H.groupby("trading_date"):
-                                    append_rows("BACKTEST", f"Heartbeat_{_d}",
-                                                HEARTBEAT_HEADERS, _g.values.tolist())
-                            st.success("Written to the backtest sheet.")
-            except Exception as e:
-                p.empty(); st.error(f"{type(e).__name__}: {e}")
-    else:
-        st.markdown(empty_state("Ready", "Pick a range and press Run backtest.", "◈"),
-                    unsafe_allow_html=True)
-
-# ================================ HISTORY ==================================
-else:
-    st.markdown(header("History", "accumulated record", SESSION_LIVE),
-                unsafe_allow_html=True)
-    c1, c2 = st.columns([1.4, 1])
-    src = c1.radio("Source", ["Live", "Backtest"], horizontal=True)
-    kind = "LIVE" if src == "Live" else "BACKTEST"
-    with c2:
-        st.write("")
-        load = st.button("Load")
-    if load:
-        tabs = list_tabs(kind, "Trades_")
-        if not tabs:
-            st.markdown(empty_state("Nothing recorded",
-                        f"No Trades_<date> tabs in the {src.lower()} sheet.", "◇"),
-                        unsafe_allow_html=True)
-        else:
-            frames = []
-            for t in tabs:
-                d = read_tab(kind, t)
-                if not d.empty:
-                    frames.append(d)
-            if not frames:
-                st.markdown(empty_state("Nothing recorded", "Tabs exist but are empty.",
-                            "◇"), unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown('<h4>Economic Events Master List</h4><div class="sub" style="margin-bottom:0.75rem;">Scheduled calendar events</div>', unsafe_allow_html=True)
+            df_ev2 = get_data("Events")
+            if not df_ev2.empty:
+                st.dataframe(df_ev2, use_container_width=True, hide_index=True)
             else:
-                A = pd.concat(frames, ignore_index=True)
-                A["pnl"] = pd.to_numeric(A.pnl, errors="coerce").fillna(0)
-                S = (A.groupby(["strategy", "trading_date"])
-                       .agg(total_pnl=("pnl", "sum"), num_legs=("pnl", "size"))
-                       .reset_index())
-                render_kpis(S, VARIANTS_LIVE,
-                            f"{S.trading_date.nunique()} sessions")
-                ch = equity_chart(S)
-                if ch is not None:
-                    st.markdown(panel("Cumulative P&L",
-                                f"{len(tabs)} day tab(s)"), unsafe_allow_html=True)
-                    st.altair_chart(ch, use_container_width=True)
-                with st.expander(f"Per-leg trades · {len(A)} rows", expanded=False):
-                    st.dataframe(A.tail(200), use_container_width=True,
-                                 hide_index=True)
-                st.download_button("Download all trades", A.to_csv(index=False),
-                                   f"{kind.lower()}_trades.csv", "text/csv")
-    else:
-        st.markdown(empty_state("Ready", "Choose a source and press Load.", "◈"),
-                    unsafe_allow_html=True)
+                st.info("No economic events scheduled.")
+
+    with col_r:
+        with st.form("re_form", clear_on_submit=True):
+            st.markdown('<h4>Add Corporate Earnings</h4><div class="sub" style="margin-bottom:1rem;">Record quarterly company earnings</div>', unsafe_allow_html=True)
+            r_date   = st.date_input("Date", today_date, key="r_d")
+            r_time   = st.selectbox("Timing", ["Before Market Open","During Market Hours","After Market Close"])
+            r_symbol = st.text_input("Company Symbol", placeholder="RELIANCE / TCS / INFOSYS")
+            r_exp    = st.text_input("Market Expectation", placeholder="PAT +12% YoY, margin expansion")
+            if st.form_submit_button("Add Corporate Result", use_container_width=True):
+                append_row("Results", {"Date": str(r_date), "Time": r_time,
+                                       "Company_Symbol": r_symbol,
+                                       "Market_Expectation": r_exp})
+                st.success("Corporate result added successfully.")
+                st.rerun()
+
+        with st.container(border=True):
+            st.markdown('<h4>Corporate Earnings Master List</h4><div class="sub" style="margin-bottom:0.75rem;">Scheduled results calendar</div>', unsafe_allow_html=True)
+            df_re2 = get_data("Results")
+            if not df_re2.empty:
+                st.dataframe(df_re2, use_container_width=True, hide_index=True)
+            else:
+                st.info("No corporate results scheduled.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 5: DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════
+elif page == "Dashboard":
+
+    df_buy  = get_data("Buy_Log")
+    df_sell = get_data("Sell_Log")
+
+    pnl_buy  = pd.to_numeric(df_buy["PnL"],       errors="coerce").sum() if not df_buy.empty  and "PnL"       in df_buy.columns  else 0.0
+    pnl_sell = pd.to_numeric(df_sell["Total_PnL"], errors="coerce").sum() if not df_sell.empty and "Total_PnL" in df_sell.columns else 0.0
+    total_pnl = pnl_buy + pnl_sell
+
+    n_buy  = len(df_buy)  if not df_buy.empty  else 0
+    n_sell = len(df_sell) if not df_sell.empty else 0
+
+    wins_b = len(df_buy [pd.to_numeric(df_buy ["PnL"],       errors="coerce") > 0]) if n_buy  else 0
+    wins_s = len(df_sell[pd.to_numeric(df_sell["Total_PnL"], errors="coerce") > 0]) if n_sell else 0
+    total_t = n_buy + n_sell
+    win_rate = (wins_b + wins_s) / total_t * 100 if total_t else 0.0
+
+    pnl_card_grad = "g5" if total_pnl >= 0 else "g1"
+
+    st.markdown(f"""
+    <div class="kpi-grid">
+      <div class="kpi {pnl_card_grad}">
+        <div class="lbl">Total Cumulative PnL</div>
+        <div class="val">INR {total_pnl:+,.2f}</div>
+        <div class="fin">Combined Buying & Selling</div>
+      </div>
+      <div class="kpi g2">
+        <div class="lbl">Buying PnL</div>
+        <div class="val">INR {pnl_buy:+,.2f}</div>
+        <div class="fin">{n_buy} trades logged</div>
+      </div>
+      <div class="kpi g3">
+        <div class="lbl">Selling PnL</div>
+        <div class="val">INR {pnl_sell:+,.2f}</div>
+        <div class="fin">{n_sell} trades logged</div>
+      </div>
+      <div class="kpi g4">
+        <div class="lbl">Win Rate</div>
+        <div class="val">{win_rate:.1f}%</div>
+        <div class="fin">{wins_b + wins_s} Wins / {total_t} Executions</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    d_col1, d_col2 = st.columns(2, gap="large")
+
+    with d_col1:
+        with st.container(border=True):
+            st.markdown('<h4>Export Trade Journal</h4><div class="sub" style="margin-bottom:1rem;">Download complete log history in Excel format</div>', unsafe_allow_html=True)
+            buf = io.BytesIO()
+            try:
+                with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                    (df_buy  if not df_buy.empty  else pd.DataFrame()).to_excel(writer, sheet_name="Buy_Log",  index=False)
+                    (df_sell if not df_sell.empty else pd.DataFrame()).to_excel(writer, sheet_name="Sell_Log", index=False)
+                excel_data = buf.getvalue()
+            except Exception:
+                excel_data = (df_buy.to_csv(index=False) if not df_buy.empty else "").encode('utf-8')
+
+            st.download_button(
+                "Export Journal (Excel)",
+                data=excel_data,
+                file_name=f"Super_App_Nifty_Journal_{today_iso}.xlsx",
+                mime="application/vnd.ms-excel",
+                use_container_width=True,
+            )
+
+    with d_col2:
+        with st.container(border=True):
+            st.markdown('<h4>Clear Database</h4><div class="sub" style="margin-bottom:1rem;">Reset active trade records for a new period</div>', unsafe_allow_html=True)
+            with st.popover("Clear All Trade Records"):
+                st.error("This action will clear all records from Buy_Log and Sell_Log.")
+                chk = st.checkbox("Confirm database reset")
+                if st.button("Permanently Clear Tables", disabled=not chk, use_container_width=True):
+                    clear_tab("Buy_Log")
+                    clear_tab("Sell_Log")
+                    st.success("Database reset complete.")
+                    st.rerun()
+
+    with st.container(border=True):
+        st.markdown('<h4>All Buying Trade Records</h4><div class="sub" style="margin-bottom:0.75rem;">Complete option buying ledger</div>', unsafe_allow_html=True)
+        if not df_buy.empty:
+            st.dataframe(df_buy, use_container_width=True, hide_index=True)
+        else:
+            st.info("No buying records available.")
+
+    with st.container(border=True):
+        st.markdown('<h4>All Selling Trade Records</h4><div class="sub" style="margin-bottom:0.75rem;">Complete option selling ledger</div>', unsafe_allow_html=True)
+        if not df_sell.empty:
+            st.dataframe(df_sell, use_container_width=True, hide_index=True)
+        else:
+            st.info("No selling records available.")
